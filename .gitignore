@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Ambienti virtuali
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# Dati locali e log di sviluppo
+*.db
+*.db-wal
+*.db-shm
+*.log
+sounds/
+ffmpeg.exe
+
+# Editor / sistema
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
