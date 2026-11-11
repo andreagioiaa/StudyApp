@@ -17,6 +17,12 @@ requests==2.32.3
 tqdm==4.67.1
 platformdirs==4.3.8
 
+# PDF e Slide: estrazione testo/layout (PyMuPDF, pdfplumber come alternativa)
+# e conversione Word con Pandoc locale (pypandoc-binary include pandoc.exe).
+pymupdf==1.27.2.3
+pdfplumber==0.11.10
+pypandoc_binary==1.17
+
 # Solo per la build dell'eseguibile
 pyinstaller==6.20.0
 
@@ -24,3 +30,9 @@ pyinstaller==6.20.0
 # nel PATH oppure come ffmpeg.exe nella cartella dati di StudyFlow. Non e' un
 # pacchetto Python. I modelli GGML di whisper.cpp non sono inclusi: vengono
 # scaricati una sola volta in %LOCALAPPDATA%\StudyFlow\models.
+#
+# PDF e Slide - motori facoltativi, installati a parte e trovati automaticamente:
+# - Tesseract-OCR (eseguibile, con la lingua "ita") per i PDF scansionati;
+# - PaddleOCR (pip install paddleocr) come OCR alternativo;
+# - Marker (pip install marker-pdf) o Nougat (pip install nougat-ocr) per le
+#   formule complesse: sono CLI basate su PyTorch, non incluse nell'exe.

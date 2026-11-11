@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import tkinter as tk
 from tkinter import messagebox
 from typing import Any
@@ -32,6 +33,7 @@ from .widgets import (
     clear_children,
     separator,
     set_window_icon,
+    render_state,
 )
 
 
@@ -227,10 +229,11 @@ class FlashcardView(ctk.CTkFrame):
 
     # ------------------------------------------------------------------ data
     def on_show(self) -> None:
-        self.refresh()
+        with render_state(self).only_if_changed():
+            self.refresh()
 
     def refresh_if_visible(self) -> None:
-        if self.winfo_ismapped():
+        if self.app.is_view_visible(self):
             self.refresh()
 
     def refresh(self) -> None:
@@ -272,6 +275,10 @@ class FlashcardView(ctk.CTkFrame):
             COLORS.accent,
         )
 
+        # Le etichette "prossimo ripasso" sono relative all'ora corrente.
+        minute = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if not render_state(self).should_render("cards", cards, minute):
+            return
         clear_children(self.cards_scroll)
         if not cards:
             empty = Card(self.cards_scroll)

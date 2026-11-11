@@ -1,11 +1,16 @@
-"""Vista Materiali e gestione PDF/documenti."""
+"""Materiali di studio collegati alle materie.
+
+I materiali non hanno piu' una sezione autonoma: ogni pagina materia mostra e
+gestisce i propri PDF, documenti e note. Questo modulo contiene la sezione
+riutilizzabile e il dialogo di creazione/modifica.
+"""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
-from typing import Any
+from typing import Any, Callable
 
 import customtkinter as ctk
 
@@ -13,143 +18,138 @@ from ..config import COLORS
 from ..utils import format_hours, safe_float
 from .formatting import format_event_datetime
 from .theme import font
-from .widgets import Card, PageHeader, StatCard, center_window, clear_children, set_window_icon
+from .widgets import Card, center_window, clear_children, set_window_icon
 
 
-class MaterialsView(ctk.CTkFrame):
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
+ORPHAN_SUBJECT = "Materiali senza materia"
+ORPHAN_SUBJECT_KEY = "\x00studyflow-orphan-materials"
+
+
+class MaterialsSection(Card):
+    """Elenco dei materiali di una materia, con azioni di studio e modifica."""
+
+    def __init__(
+        self,
+        master,
+        app,
+        subject: str,
+        on_change: Callable[[], None] | None = None,
+        allow_add: bool = True,
+        allow_subject_change: bool = False,
+    ):
+        super().__init__(master)
         self.app = app
         self.db = app.db
+        self._subject = str(subject or "")
+        self._on_change = on_change
+        self._allow_subject_change = allow_subject_change
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
 
-        header_row = ctk.CTkFrame(self, fg_color="transparent")
-        header_row.grid(row=0, column=0, sticky="ew", pady=(0, 18))
-        header_row.grid_columnconfigure(0, weight=1)
-        PageHeader(
-            header_row,
-            "Materiali di studio",
-            "PDF, documenti e note collegati alle materie e agli eventi del calendario.",
-        ).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(
-            header_row,
-            text="+  Nuovo materiale",
-            height=40,
-            width=170,
-            font=font(12, "bold"),
-            fg_color=COLORS.accent,
-            hover_color=COLORS.accent_hover,
-            text_color=COLORS.bg,
-            corner_radius=10,
-            command=lambda: self._open_dialog(None),
-        ).grid(row=0, column=1, sticky="e", pady=(4, 0))
-
-        summary = ctk.CTkFrame(self, fg_color="transparent")
-        summary.grid(row=1, column=0, sticky="ew", pady=(0, 14))
-        for column in range(3):
-            summary.grid_columnconfigure(column, weight=1, uniform="materials")
-        self.count_card = StatCard(summary, "MATERIALI", "0", "File collegati", COLORS.blue)
-        self.count_card.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self.target_card = StatCard(summary, "ORE PREVISTE", "0.0 h", "Somma obiettivi", COLORS.purple)
-        self.target_card.grid(row=0, column=1, sticky="ew", padx=8)
-        self.logged_card = StatCard(summary, "ORE REGISTRATE", "0.0 h", "Studio effettivo", COLORS.accent)
-        self.logged_card.grid(row=0, column=2, sticky="ew", padx=(8, 0))
-
-        self.hint = ctk.CTkLabel(
-            self,
-            text="",
-            font=font(10),
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(14, 6))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header,
+            text="MATERIALI",
+            font=font(9, "bold"),
             text_color=COLORS.text_faint,
             anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self._count_label = ctk.CTkLabel(
+            header,
+            text="",
+            font=font(10),
+            text_color=COLORS.text_muted,
+            anchor="w",
         )
-        self.hint.grid(row=2, column=0, sticky="w", pady=(0, 6))
+        self._count_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        if allow_add:
+            ctk.CTkButton(
+                header,
+                text="+  Materiale",
+                height=32,
+                width=126,
+                font=font(10, "bold"),
+                fg_color=COLORS.accent_dark,
+                hover_color=COLORS.accent_hover,
+                text_color=COLORS.text,
+                corner_radius=8,
+                command=lambda: self._open_dialog(None),
+            ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(10, 0))
 
-        self.materials_scroll = ctk.CTkScrollableFrame(
-            self,
-            fg_color="transparent",
-            scrollbar_button_color=COLORS.border,
-            scrollbar_button_hover_color=COLORS.surface_hover,
-        )
-        self.materials_scroll.grid(row=3, column=0, sticky="nsew")
-        self.materials_scroll.grid_columnconfigure(0, weight=1)
+        self._list = ctk.CTkFrame(self, fg_color="transparent")
+        self._list.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 14))
+        self._list.grid_columnconfigure(0, weight=1)
 
-    # ------------------------------------------------------------------ data
-    def on_show(self) -> None:
         self.refresh()
 
-    def refresh_if_visible(self) -> None:
-        if self.winfo_ismapped():
-            self.refresh()
-
+    # ------------------------------------------------------------------ data
     def refresh(self) -> None:
-        materials = self.db.list_materials()
-        clear_children(self.materials_scroll)
-        self.count_card.set(str(len(materials)), "File collegati", COLORS.blue)
+        if self._subject:
+            materials = self.db.list_materials_for_subject(self._subject)
+        else:
+            materials = self.db.list_materials_without_subject()
+        clear_children(self._list)
         target = sum(safe_float(row.get("target_hours", 0)) for row in materials)
         logged = sum(safe_float(row.get("logged_hours", 0)) for row in materials)
-        self.target_card.set(format_hours(target), "Somma obiettivi", COLORS.purple)
-        self.logged_card.set(format_hours(logged), "Studio effettivo", COLORS.accent)
-        self.hint.configure(
-            text=(
-                "Le ore si aggiornano automaticamente quando avvii un Pomodoro da un materiale. "
-                "Puoi anche registrarle manualmente."
-            )
-        )
+        if materials:
+            detail = f"{len(materials)} file · {format_hours(logged)} registrate"
+            if target > 0:
+                detail += f" su {format_hours(target)} previste"
+            self._count_label.configure(text=detail)
+        else:
+            self._count_label.configure(text="Nessun file collegato")
+
         if not materials:
-            empty = Card(self.materials_scroll)
-            empty.grid(row=0, column=0, sticky="ew", pady=(4, 0))
             ctk.CTkLabel(
-                empty,
-                text="Nessun materiale ancora.",
-                font=font(14, "bold"),
-                text_color=COLORS.text_muted,
-            ).pack(anchor="w", padx=22, pady=(24, 3))
-            ctk.CTkLabel(
-                empty,
-                text="Aggiungi un PDF o un documento e collegalo a una materia o a un evento.",
+                self._list,
+                text=(
+                    "Nessun materiale per questa materia. "
+                    "Aggiungi dispense, PDF o documenti."
+                    if self._subject
+                    else "Tutti i materiali sono collegati a una materia."
+                ),
                 font=font(11),
                 text_color=COLORS.text_faint,
-            ).pack(anchor="w", padx=22, pady=(0, 24))
+                anchor="w",
+                wraplength=420,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w", pady=(0, 2))
             return
         for index, material in enumerate(materials):
-            self._material_card(material, index)
+            self._material_row(material, index)
 
-    def _material_card(self, material: dict[str, Any], row: int) -> None:
+    def notify_change(self) -> None:
+        """Aggiorna la sezione e la pagina materia che la contiene."""
+        if self._on_change is not None:
+            self._on_change()
+        else:
+            self.refresh()
+
+    # ------------------------------------------------------------------ rows
+    def _material_row(self, material: dict[str, Any], row: int) -> None:
         card = ctk.CTkFrame(
-            self.materials_scroll,
-            fg_color=COLORS.surface,
-            corner_radius=12,
+            self._list,
+            fg_color=COLORS.surface_alt,
+            corner_radius=10,
             border_width=1,
             border_color=COLORS.border,
         )
-        card.grid(row=row, column=0, sticky="ew", pady=4)
+        card.grid(row=row, column=0, sticky="ew", pady=3)
         card.grid_columnconfigure(0, weight=1)
 
-        top = ctk.CTkFrame(card, fg_color="transparent")
-        top.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 2))
-        top.grid_columnconfigure(0, weight=1)
         title = str(material.get("title") or "Materiale")
         ctk.CTkLabel(
-            top,
+            card,
             text=title,
-            font=font(15, "bold"),
+            font=font(13, "bold"),
             text_color=COLORS.text,
             anchor="w",
-        ).grid(row=0, column=0, sticky="w")
-        subject = str(material.get("subject") or "Senza materia")
-        ctk.CTkLabel(
-            top,
-            text=subject,
-            font=font(9, "bold"),
-            text_color=COLORS.accent,
-            fg_color=COLORS.accent_dark,
-            corner_radius=6,
-            padx=8,
-            height=22,
-        ).grid(row=0, column=1, sticky="e", padx=(10, 0))
+            wraplength=380,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 1))
 
-        meta_parts = []
+        meta_parts: list[str] = []
         if material.get("event_title"):
             event_text = str(material["event_title"])
             if material.get("event_start"):
@@ -163,15 +163,15 @@ class MaterialsView(ctk.CTkFrame):
             ctk.CTkLabel(
                 card,
                 text="  ·  ".join(meta_parts),
-                font=font(10),
+                font=font(9),
                 text_color=COLORS.red if file_path and not path_exists else COLORS.text_faint,
                 anchor="w",
-                wraplength=720,
+                wraplength=420,
                 justify="left",
-            ).grid(row=1, column=0, sticky="ew", padx=18)
+            ).grid(row=1, column=0, sticky="w", padx=14)
 
         progress_frame = ctk.CTkFrame(card, fg_color="transparent")
-        progress_frame.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 5))
+        progress_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(8, 4))
         progress_frame.grid_columnconfigure(0, weight=1)
         target_hours = safe_float(material.get("target_hours", 0))
         logged_hours = safe_float(material.get("logged_hours", 0))
@@ -184,98 +184,95 @@ class MaterialsView(ctk.CTkFrame):
         ctk.CTkLabel(
             progress_frame,
             text=progress_text,
-            font=font(10, "bold"),
+            font=font(9, "bold"),
             text_color=COLORS.text_muted,
             anchor="w",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ).grid(row=0, column=0, sticky="w", pady=(0, 3))
         bar = ctk.CTkProgressBar(
             progress_frame,
-            height=8,
-            corner_radius=4,
-            fg_color=COLORS.surface_alt,
+            height=6,
+            corner_radius=3,
+            fg_color=COLORS.surface,
             progress_color=COLORS.accent if ratio < 1 else COLORS.green,
         )
         bar.grid(row=1, column=0, sticky="ew")
         bar.set(ratio)
 
         actions = ctk.CTkFrame(card, fg_color="transparent")
-        actions.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 14))
-        ctk.CTkButton(
+        actions.grid(row=3, column=0, sticky="ew", padx=14, pady=(6, 10))
+        self._action(
             actions,
-            text="Apri file",
-            height=32,
-            width=92,
-            font=font(11, "bold"),
-            fg_color=COLORS.surface_alt,
-            hover_color=COLORS.surface_hover,
-            border_width=1,
-            border_color=COLORS.border,
-            text_color=COLORS.text,
-            corner_radius=8,
-            command=lambda path=file_path: self._open_file(path),
-        ).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(
+            "Apri file",
+            78,
+            lambda path=file_path: self._open_file(path),
+        ).pack(side="left", padx=(0, 4))
+        self._action(
             actions,
-            text="Studia ora",
-            height=32,
-            width=104,
-            font=font(11, "bold"),
-            fg_color=COLORS.accent_dark,
-            hover_color=COLORS.accent_hover,
-            text_color=COLORS.text,
-            corner_radius=8,
-            command=lambda value=dict(material): self.app.start_from_material(value),
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
+            "Studia ora",
+            86,
+            lambda value=dict(material): self.app.start_from_material(value),
+            primary=True,
+        ).pack(side="left", padx=4)
+        self._action(
             actions,
-            text="Aggiungi ore",
-            height=32,
-            width=100,
-            font=font(11),
-            fg_color="transparent",
-            hover_color=COLORS.surface_alt,
-            border_width=1,
-            border_color=COLORS.border,
-            text_color=COLORS.text_muted,
-            corner_radius=8,
-            command=lambda material_id=int(material["id"]): self._add_hours(material_id),
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
+            "Aggiungi ore",
+            90,
+            lambda material_id=int(material["id"]): self._add_hours(material_id),
+        ).pack(side="left", padx=4)
+        self._action(
             actions,
-            text="Modifica",
-            height=32,
-            width=82,
-            font=font(11),
-            fg_color="transparent",
-            hover_color=COLORS.surface_alt,
-            border_width=1,
-            border_color=COLORS.border,
-            text_color=COLORS.text_muted,
-            corner_radius=8,
-            command=lambda value=dict(material): self._open_dialog(value),
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
+            "Modifica",
+            70,
+            lambda value=dict(material): self._open_dialog(value),
+        ).pack(side="left", padx=4)
+        self._action(
             actions,
-            text="Elimina",
-            height=32,
-            width=76,
-            font=font(11),
-            fg_color="transparent",
-            hover_color=COLORS.red_dark,
-            border_width=1,
-            border_color=COLORS.border,
-            text_color=COLORS.red,
-            corner_radius=8,
-            command=lambda value=dict(material): self._delete(value),
+            "Elimina",
+            64,
+            lambda value=dict(material): self._delete(value),
+            danger=True,
         ).pack(side="right")
 
-    # ------------------------------------------------------------------ actions
+    def _action(
+        self,
+        parent,
+        text: str,
+        width: int,
+        command,
+        primary: bool = False,
+        danger: bool = False,
+    ) -> ctk.CTkButton:
+        return ctk.CTkButton(
+            parent,
+            text=text,
+            height=30,
+            width=width,
+            font=font(10, "bold" if primary or danger else "normal"),
+            fg_color=COLORS.accent_dark if primary else "transparent",
+            hover_color=COLORS.red_dark if danger else COLORS.surface_hover,
+            border_width=0 if primary else 1,
+            border_color=COLORS.border,
+            text_color=COLORS.red if danger else COLORS.text if primary else COLORS.text_muted,
+            corner_radius=7,
+            command=command,
+        )
+
+    # --------------------------------------------------------------- actions
     def _open_dialog(self, material: dict[str, Any] | None) -> None:
-        MaterialDialog(self, material)
+        MaterialDialog(
+            self,
+            material,
+            self._subject,
+            allow_subject_change=self._allow_subject_change,
+        )
 
     def _open_file(self, file_path: str) -> None:
         if not file_path:
-            messagebox.showwarning("File non impostato", "Nessun file associato a questo materiale.", parent=self.winfo_toplevel())
+            messagebox.showwarning(
+                "File non impostato",
+                "Nessun file associato a questo materiale.",
+                parent=self.winfo_toplevel(),
+            )
             return
         path = Path(file_path)
         if not path.exists():
@@ -288,7 +285,11 @@ class MaterialsView(ctk.CTkFrame):
         try:
             os.startfile(str(path))  # type: ignore[attr-defined]
         except (OSError, AttributeError) as exc:
-            messagebox.showerror("Impossibile aprire il file", str(exc), parent=self.winfo_toplevel())
+            messagebox.showerror(
+                "Impossibile aprire il file",
+                str(exc),
+                parent=self.winfo_toplevel(),
+            )
 
     def _add_hours(self, material_id: int) -> None:
         value = simpledialog.askfloat(
@@ -302,41 +303,52 @@ class MaterialsView(ctk.CTkFrame):
         if value is None:
             return
         self.db.add_material_hours(material_id, float(value))
-        self.refresh()
         self.app.toast(f"Aggiunte {value:g} ore al materiale.")
+        self.notify_change()
 
     def _delete(self, material: dict[str, Any]) -> None:
         if not messagebox.askyesno(
             "Eliminare il materiale?",
-            f"Eliminare '{material.get('title', 'Materiale')}'? Il file originale non verra' toccato.",
+            f"Eliminare '{material.get('title', 'Materiale')}'? "
+            "Il file originale non verra' toccato.",
             parent=self.winfo_toplevel(),
         ):
             return
         self.db.delete_material(int(material["id"]))
-        self.refresh()
+        self.app.toast("Materiale eliminato.")
+        self.notify_change()
 
 
 class MaterialDialog(ctk.CTkToplevel):
-    def __init__(self, view: MaterialsView, material: dict[str, Any] | None):
-        super().__init__(view.winfo_toplevel())
-        self.view = view
-        self.app = view.app
-        self.db = view.db
+    def __init__(
+        self,
+        section: MaterialsSection,
+        material: dict[str, Any] | None,
+        subject: str,
+        allow_subject_change: bool = False,
+    ):
+        super().__init__(section.winfo_toplevel())
+        self.section = section
+        self.app = section.app
+        self.db = section.db
         self.material = material
+        self.fixed_subject = str(subject or "")
+        self.allow_subject_change = allow_subject_change
         self._event_ids: list[int | None] = [None]
         self._event_labels: list[str] = ["Nessun evento"]
         self.title("Modifica materiale" if material else "Nuovo materiale")
         self.configure(fg_color=COLORS.bg)
         self.resizable(False, False)
-        self.transient(view.winfo_toplevel())
+        self.transient(section.winfo_toplevel())
         set_window_icon(self, self.app.paths["icon"])
-        center_window(self, 660, 610)
+        center_window(self, 640, 590)
         self.grid_columnconfigure(0, weight=1)
         self._build()
         self.grab_set()
-        self.after(100, self._populate_events)
+        self.after(100, self._populate)
         self.bind("<Escape>", lambda _event: self.destroy())
 
+    # ------------------------------------------------------------------ layout
     def _build(self) -> None:
         ctk.CTkLabel(
             self,
@@ -347,22 +359,57 @@ class MaterialDialog(ctk.CTkToplevel):
         ).grid(row=0, column=0, sticky="w", padx=28, pady=(24, 2))
         ctk.CTkLabel(
             self,
-            text="Collega un PDF o documento a una materia e, se vuoi, a un evento.",
+            text="Il materiale resta collegato alla materia e, se vuoi, a un evento.",
             font=font(11),
             text_color=COLORS.text_muted,
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", padx=28, pady=(0, 18))
+        ).grid(row=1, column=0, sticky="w", padx=28, pady=(0, 16))
 
         form = ctk.CTkFrame(self, fg_color="transparent")
         form.grid(row=2, column=0, sticky="ew", padx=28)
         form.grid_columnconfigure(0, weight=1)
 
         self.title_var = ctk.StringVar()
-        self.subject_var = ctk.StringVar()
         self.target_var = ctk.StringVar(value="0")
         self.file_var = ctk.StringVar()
+        self.subject_var = ctk.StringVar(value=self.fixed_subject)
         self._field(form, 0, "Titolo", self.title_var, "es. Dispense Capitolo 3")
-        self._field(form, 1, "Materia", self.subject_var, "es. Analisi Matematica")
+
+        if self.allow_subject_change:
+            self._field(
+                form,
+                1,
+                "Materia *",
+                self.subject_var,
+                "es. Analisi Matematica",
+                hint=(
+                    "Obbligatoria: il materiale comparirà nella pagina di questa "
+                    "materia. Puoi anche scrivere il nome di una nuova materia."
+                ),
+            )
+        else:
+            subject_card = ctk.CTkFrame(
+                form,
+                fg_color=COLORS.surface_alt,
+                corner_radius=9,
+                border_width=1,
+                border_color=COLORS.border,
+            )
+            subject_card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+            ctk.CTkLabel(
+                subject_card,
+                text="MATERIA",
+                font=font(9, "bold"),
+                text_color=COLORS.text_faint,
+                anchor="w",
+            ).pack(anchor="w", padx=14, pady=(8, 0))
+            ctk.CTkLabel(
+                subject_card,
+                text=self.fixed_subject or "Senza materia",
+                font=font(13, "bold"),
+                text_color=COLORS.text,
+                anchor="w",
+            ).pack(anchor="w", padx=14, pady=(1, 9))
 
         file_frame = ctk.CTkFrame(form, fg_color="transparent")
         file_frame.grid(row=2, column=0, sticky="ew", pady=(0, 12))
@@ -437,11 +484,12 @@ class MaterialDialog(ctk.CTkToplevel):
         info.grid(row=3, column=0, sticky="ew", padx=28, pady=(4, 16))
         ctk.CTkLabel(
             info,
-            text="Le ore studiate si aggiungono automaticamente quando completi un Pomodoro "
-            "avviato da questo materiale. Il file originale non viene copiato ne' modificato.",
+            text="Le ore studiate si aggiungono automaticamente quando completi un "
+            "Pomodoro avviato da questo materiale. Il file originale non viene "
+            "copiato ne' modificato.",
             font=font(10),
             text_color=COLORS.text_muted,
-            wraplength=580,
+            wraplength=560,
             justify="left",
             anchor="w",
         ).pack(anchor="w", padx=16, pady=12)
@@ -476,12 +524,35 @@ class MaterialDialog(ctk.CTkToplevel):
             command=self._save,
         ).grid(row=0, column=1, sticky="e")
 
-    def _field(self, parent, row: int, label: str, variable: ctk.StringVar, placeholder: str) -> None:
-        frame, _entry = self._labeled_entry(parent, label, variable, placeholder)
+    def _field(
+        self,
+        parent,
+        row: int,
+        label: str,
+        variable: ctk.StringVar,
+        placeholder: str,
+        hint: str = "",
+    ) -> ctk.CTkEntry:
+        frame, entry = self._labeled_entry(parent, label, variable, placeholder)
+        if hint:
+            ctk.CTkLabel(
+                frame,
+                text=hint,
+                font=font(9),
+                text_color=COLORS.text_faint,
+                anchor="w",
+                wraplength=560,
+                justify="left",
+            ).pack(anchor="w", pady=(4, 0))
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        return entry
 
     def _labeled_entry(
-        self, parent, label: str, variable: ctk.StringVar, placeholder: str
+        self,
+        parent,
+        label: str,
+        variable: ctk.StringVar,
+        placeholder: str,
     ) -> tuple[ctk.CTkFrame, ctk.CTkEntry]:
         frame = ctk.CTkFrame(parent, fg_color="transparent")
         ctk.CTkLabel(
@@ -505,12 +576,14 @@ class MaterialDialog(ctk.CTkToplevel):
         entry.pack(fill="x")
         return frame, entry
 
-    def _populate_events(self) -> None:
+    # ------------------------------------------------------------------ data
+    def _populate(self) -> None:
         if self.material:
             self.title_var.set(str(self.material.get("title") or ""))
-            self.subject_var.set(str(self.material.get("subject") or ""))
             self.target_var.set(f"{safe_float(self.material.get('target_hours', 0)):g}")
             self.file_var.set(str(self.material.get("file_path") or ""))
+            if self.allow_subject_change:
+                self.subject_var.set(str(self.material.get("subject") or ""))
         try:
             events = self.db.list_events_for_materials()
         except Exception:
@@ -518,7 +591,10 @@ class MaterialDialog(ctk.CTkToplevel):
         self._event_ids = [None]
         self._event_labels = ["Nessun evento"]
         for event in events:
-            label = f"{str(event['title'])[:60]} · {format_event_datetime(str(event['start']))}"
+            label = (
+                f"{str(event['title'])[:60]} · "
+                f"{format_event_datetime(str(event['start']))}"
+            )
             if label in self._event_labels:
                 label = f"{label} (#{event['id']})"
             self._event_labels.append(label)
@@ -527,8 +603,6 @@ class MaterialDialog(ctk.CTkToplevel):
         if self.material and self.material.get("calendar_event_id"):
             linked_id = int(self.material["calendar_event_id"])
         if linked_id is not None and linked_id not in self._event_ids:
-            # Un evento passato puo' non rientrare nell'elenco dei materiali:
-            # va comunque mostrato per non perdere il collegamento in modifica.
             try:
                 linked_event = self.db.get_event(linked_id)
             except Exception:
@@ -570,13 +644,32 @@ class MaterialDialog(ctk.CTkToplevel):
     def _save(self) -> None:
         title = self.title_var.get().strip()
         file_path = self.file_var.get().strip()
-        subject = self.subject_var.get().strip()
+        subject = (
+            self.subject_var.get().strip()
+            if self.allow_subject_change
+            else self.fixed_subject.strip()
+        )
         target = safe_float(self.target_var.get(), -1)
         if not title:
-            messagebox.showerror("Titolo mancante", "Inserisci un titolo per il materiale.", parent=self)
+            messagebox.showerror(
+                "Titolo mancante",
+                "Inserisci un titolo per il materiale.",
+                parent=self,
+            )
+            return
+        if not subject:
+            messagebox.showerror(
+                "Materia mancante",
+                "Seleziona la materia a cui collegare il materiale.",
+                parent=self,
+            )
             return
         if not file_path:
-            messagebox.showerror("File mancante", "Seleziona un file PDF o documento.", parent=self)
+            messagebox.showerror(
+                "File mancante",
+                "Seleziona un file PDF o documento.",
+                parent=self,
+            )
             return
         if not Path(file_path).exists():
             if not messagebox.askyesno(
@@ -586,7 +679,11 @@ class MaterialDialog(ctk.CTkToplevel):
             ):
                 return
         if target < 0 or target > 10000:
-            messagebox.showerror("Valore non valido", "Le ore previste devono essere tra 0 e 10000.", parent=self)
+            messagebox.showerror(
+                "Valore non valido",
+                "Le ore previste devono essere tra 0 e 10000.",
+                parent=self,
+            )
             return
         label = self.event_combo.get()
         try:
@@ -609,7 +706,10 @@ class MaterialDialog(ctk.CTkToplevel):
             self.app.logger.exception("Salvataggio materiale non riuscito.")
             messagebox.showerror("Salvataggio non riuscito", str(exc), parent=self)
             return
-        self.grab_release()
+        try:
+            self.grab_release()
+        except Exception:
+            pass
         self.destroy()
-        self.view.refresh()
         self.app.toast("Materiale salvato.")
+        self.section.notify_change()

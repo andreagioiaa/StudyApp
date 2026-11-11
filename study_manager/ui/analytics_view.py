@@ -13,7 +13,7 @@ import customtkinter as ctk
 from ..config import COLORS, quality_score
 from ..utils import month_bounds
 from .theme import font
-from .widgets import Card, PageHeader, StatCard, clear_children, separator
+from .widgets import Card, PageHeader, StatCard, clear_children, separator, render_state
 
 
 LOGGER = logging.getLogger(__name__)
@@ -240,8 +240,16 @@ class AnalyticsView(ctk.CTkFrame):
             self._charts_started = True
             self.after(80, self._init_matplotlib)
 
+    def prepare_in_background(self) -> None:
+        """Carica Matplotlib e disegna i grafici prima della prima apertura."""
+        if self._charts_started:
+            return
+        self._charts_started = True
+        self.refresh()
+        self.after(50, self._init_matplotlib)
+
     def refresh_if_visible(self) -> None:
-        if self.winfo_ismapped():
+        if self.app.is_view_visible(self):
             self.refresh()
 
     def _change_range(self, value: str) -> None:
@@ -322,7 +330,7 @@ class AnalyticsView(ctk.CTkFrame):
             self._fmt(chart_start), self._fmt(chart_end)
         )
         if self._charts_ready:
-            self._draw_charts()
+            self._draw_charts(only_if_changed=True)
 
     @staticmethod
     def _fmt(value: datetime) -> str:
@@ -431,9 +439,26 @@ class AnalyticsView(ctk.CTkFrame):
                 wraplength=330,
             ).place(relx=0.5, rely=0.5, anchor="center")
 
-    def _draw_charts(self) -> None:
+    def _draw_charts(self, only_if_changed: bool = False) -> None:
         if not self._charts_ready or not self._hours_figure or not self._attempts_figure:
             return
+        # Ridisegnare un canvas Matplotlib lo cancella e lo ricompone: a dati
+        # invariati (tipico cambio di sezione) si lascia l'immagine com'e'.
+        state = render_state(self)
+        signature = (
+            self._range_days,
+            self._chart1_mode,
+            self._chart2_mode,
+            self._hour_data,
+            self._attempt_hour_data,
+            self._attempt_source_data,
+        )
+        if only_if_changed:
+            with state.only_if_changed():
+                if not state.should_render("charts", *signature):
+                    return
+        else:
+            state.should_render("charts", *signature)
         self._draw_hours_chart()
         self._draw_attempts_chart()
 

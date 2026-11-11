@@ -11,7 +11,7 @@ import customtkinter as ctk
 from ..config import COLORS
 from ..utils import normalize_domain, normalize_process_name
 from .theme import font
-from .widgets import Card, PageHeader, StatCard, clear_children, separator
+from .widgets import Card, PageHeader, StatCard, clear_children, separator, render_state
 
 
 class BlockerView(ctk.CTkFrame):
@@ -354,7 +354,8 @@ class BlockerView(ctk.CTkFrame):
         self.apps_enabled_var.set(self._bool(settings.get("block_apps_enabled", "1")))
         self.terminate_var.set(self._bool(settings.get("terminate_blocked_apps", "1")))
         self.trap_var.set(self._bool(settings.get("web_trap_enabled", "1")))
-        self._refresh_lists()
+        with render_state(self).only_if_changed():
+            self._refresh_lists()
         self._refresh_status()
         self._start_poll()
 
@@ -366,8 +367,11 @@ class BlockerView(ctk.CTkFrame):
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _refresh_lists(self) -> None:
-        clear_children(self.sites_list)
         sites = self.db.list_blocked_sites()
+        apps = self.db.list_blocked_apps()
+        if not render_state(self).should_render("lists", sites, apps):
+            return
+        clear_children(self.sites_list)
         if not sites:
             ctk.CTkLabel(
                 self.sites_list,
@@ -415,7 +419,6 @@ class BlockerView(ctk.CTkFrame):
             ).grid(row=0, column=2, padx=(0, 2))
 
         clear_children(self.apps_list)
-        apps = self.db.list_blocked_apps()
         if not apps:
             ctk.CTkLabel(
                 self.apps_list,

@@ -30,13 +30,13 @@ from .audio_view import AudioView
 from .blocker_view import BlockerView
 from .calendar_view import CalendarView
 from .flashcard_view import FlashcardView
-from .materials_view import MaterialsView
+from .pdf_view import PdfView
 from .pomodoro_view import PomodoroView
 from .settings_view import SettingsView
 from .subjects_view import SubjectsView
 from .theme import configure_theme, font
 from .video_view import VideoView
-from .widgets import set_window_icon
+from .widgets import render_state, set_window_icon
 
 
 LOGGER = logging.getLogger(__name__)
@@ -94,7 +94,11 @@ class StudyFlowApp(ctk.CTk):
         self._build_toast()
         self._setup_signals()
 
-        self.after(80, lambda: self.show_view("pomodoro"))
+        self._prefill_views(exclude="pomodoro")
+        self.show_view("pomodoro")
+        # I grafici della dashboard (Matplotlib) si preparano in sottofondo poco
+        # dopo l'avvio, cosi' anche "Analisi" e' pronta al primo clic.
+        self.after(1500, self._warm_up_views)
         self.after(1000, self._global_poll)
 
     # ------------------------------------------------------------------ chrome
@@ -156,9 +160,9 @@ class StudyFlowApp(ctk.CTk):
             ("pomodoro", "◷", "Pomodoro"),
             ("audio", "♫", "Audio"),
             ("videos", "▷", "Video e Trascrizione"),
+            ("pdf", "▤", "PDF e Slide"),
             ("blocker", "◈", "Blocco distrazioni"),
             ("calendar", "▦", "Calendario"),
-            ("materials", "▤", "Materiali"),
             ("subjects", "▥", "Materie"),
             ("flashcards", "▣", "Flashcard"),
             ("analytics", "◔", "Analisi"),
@@ -168,7 +172,7 @@ class StudyFlowApp(ctk.CTk):
             button = ctk.CTkButton(
                 nav,
                 text=f"  {icon}   {label}",
-                height=42,
+                height=40,
                 font=font(12, "bold"),
                 fg_color="transparent",
                 hover_color=COLORS.surface_alt,
@@ -232,29 +236,104 @@ class StudyFlowApp(ctk.CTk):
         self.content.grid(row=0, column=1, sticky="nsew")
         self.content.grid_rowconfigure(0, weight=1)
         self.content.grid_columnconfigure(0, weight=1)
-        # Le viste vengono create alla prima apertura: l'avvio resta leggero e
-        # Matplotlib viene caricato soltanto quando si apre la dashboard.
+        # Tutte le viste vengono create all'avvio e restano in vita fino alla
+        # chiusura: sono impilate nella stessa cella della griglia e il cambio
+        # di sezione porta in primo piano quella scelta (tkraise). Nessuna vista
+        # viene nascosta con grid_forget o distrutta, quindi i widget non vanno
+        # ridisegnati a ogni cambio e non c'e' sfarfallio.
         self._view_factories = {
             "pomodoro": PomodoroView,
             "audio": AudioView,
             "videos": VideoView,
+            "pdf": PdfView,
             "blocker": BlockerView,
             "calendar": CalendarView,
-            "materials": MaterialsView,
             "subjects": SubjectsView,
             "flashcards": FlashcardView,
             "analytics": AnalyticsView,
             "settings": SettingsView,
         }
         self.views = {}
+        for key in self._view_factories:
+            self._ensure_view(key)
 
     def _ensure_view(self, key: str):
         view = self.views.get(key)
         if view is None:
             factory = self._view_factories[key]
-            view = factory(self.content, self)
+            started = time.perf_counter()
+            try:
+                view = factory(self.content, self)
+            except Exception as exc:
+                # Una vista difettosa non deve impedire l'avvio delle altre.
+                self.logger.exception("Creazione della vista '%s' non riuscita.", key)
+                view = self._error_view(key, exc)
+            view.grid(row=0, column=0, sticky="nsew", padx=24, pady=(18, 12))
+            view.lower()
             self.views[key] = view
+            self.logger.debug(
+                "Vista '%s' creata in %.0f ms.", key, (time.perf_counter() - started) * 1000
+            )
         return view
+
+    def _error_view(self, key: str, error: Exception) -> ctk.CTkFrame:
+        frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        ctk.CTkLabel(
+            frame,
+            text=f"La sezione '{key}' non e' disponibile.",
+            font=font(18, "bold"),
+            text_color=COLORS.text,
+            anchor="w",
+        ).pack(anchor="w", pady=(10, 6))
+        ctk.CTkLabel(
+            frame,
+            text=f"{error}\n\nDettagli in studyflow.log.",
+            font=font(12),
+            text_color=COLORS.text_muted,
+            anchor="w",
+            justify="left",
+        ).pack(anchor="w")
+        return frame
+
+    def is_view_visible(self, view: Any) -> bool:
+        """True se ``view`` e' la sezione in primo piano.
+
+        Con le viste sempre presenti ``winfo_ismapped`` e' vero per tutte,
+        quindi le viste chiedono all'app quale sia quella visibile.
+        """
+        if self._closing or self._current_view is None:
+            return False
+        return self.views.get(self._current_view) is view
+
+    def _prefill_views(self, exclude: str = "") -> None:
+        """Popola subito tutte le sezioni con i dati, ancora coperte.
+
+        ``on_show`` carica i dati e ``on_hide`` ferma gli eventuali timer di
+        aggiornamento, cosi' le sezioni nascoste non consumano CPU ma alla
+        prima apertura sono gia' complete.
+        """
+        for key, view in list(self.views.items()):
+            if key == exclude:
+                continue
+            try:
+                if hasattr(view, "on_show"):
+                    view.on_show()
+                if hasattr(view, "on_hide"):
+                    view.on_hide()
+            except Exception:
+                self.logger.exception("Precaricamento della vista '%s' non riuscito.", key)
+
+    def _warm_up_views(self) -> None:
+        if self._closing:
+            return
+        for key, view in list(self.views.items()):
+            prepare = getattr(view, "prepare_in_background", None)
+            if prepare is None:
+                continue
+            try:
+                prepare()
+            except Exception:
+                self.logger.exception("Preparazione della vista '%s' non riuscita.", key)
 
     def _build_toast(self) -> None:
         self._toast = ctk.CTkLabel(
@@ -278,23 +357,26 @@ class StudyFlowApp(ctk.CTk):
             if hasattr(view, "on_show"):
                 view.on_show()
             return
-        if self._current_view:
-            old = self.views.get(self._current_view)
-            if old is not None:
-                if hasattr(old, "on_hide"):
-                    old.on_hide()
-                old.grid_forget()
+        old = self.views.get(self._current_view) if self._current_view else None
+        if old is not None and hasattr(old, "on_hide"):
+            old.on_hide()
         view = self._ensure_view(key)
-        view.grid(row=0, column=0, sticky="nsew", padx=24, pady=(18, 12))
         self._current_view = key
-        for nav_key, button in self._nav_buttons.items():
-            active = nav_key == key
-            button.configure(
-                fg_color=COLORS.surface_alt if active else "transparent",
-                text_color=COLORS.accent if active else COLORS.text_muted,
-            )
+        # La vista si aggiorna (solo se i dati sono cambiati) mentre e' ancora
+        # coperta, poi viene portata in primo piano: nessuna rimozione dalla
+        # griglia, nessun ridisegno completo.
         if hasattr(view, "on_show"):
             view.on_show()
+        view.tkraise()
+        for nav_key, button in self._nav_buttons.items():
+            active = nav_key == key
+            colors = (
+                COLORS.surface_alt if active else "transparent",
+                COLORS.accent if active else COLORS.text_muted,
+            )
+            if getattr(button, "_studyflow_colors", None) != colors:
+                button._studyflow_colors = colors
+                button.configure(fg_color=colors[0], text_color=colors[1])
 
     # ------------------------------------------------------------------ events
     def start_from_event(self, event: dict[str, Any]) -> None:
@@ -340,9 +422,9 @@ class StudyFlowApp(ctk.CTk):
         if result_id and result_id == self._last_result_id:
             return
         self._last_result_id = result_id or self._last_result_id
-        materials = self.views.get("materials")
-        if materials is not None:
-            materials.refresh_if_visible()
+        subjects = self.views.get("subjects")
+        if subjects is not None:
+            subjects.refresh_if_visible()
         analytics = self.views.get("analytics")
         if analytics is not None:
             analytics.refresh_if_visible()
@@ -435,7 +517,13 @@ class StudyFlowApp(ctk.CTk):
             self.pomodoro.reload_config()
         except Exception:
             self.logger.exception("Ricarica Pomodoro dopo importazione non riuscita.")
+        # Solo la sezione visibile si aggiorna subito; le altre ricostruiscono
+        # alla prossima apertura (i dati importati cambiano la loro firma).
+        current = self.views.get(self._current_view) if self._current_view else None
         for key, view in list(self.views.items()):
+            render_state(view).forget()
+            if view is not current:
+                continue
             try:
                 if hasattr(view, "on_show"):
                     view.on_show()
@@ -731,6 +819,9 @@ class StudyFlowApp(ctk.CTk):
                 "La trascrizione in corso verra' annullata. Il file .txt precedente, "
                 "se presente, non verra' modificato."
             )
+        pdf_view = self.views.get("pdf")
+        if pdf_view is not None and pdf_view.is_busy():
+            warnings.append("L'elaborazione PDF in corso verra' interrotta.")
         if warnings and not messagebox.askyesno(
             "Uscire da StudyFlow?",
             "\n\n".join(warnings) + "\n\nUscire comunque?",
@@ -777,6 +868,12 @@ class StudyFlowApp(ctk.CTk):
             self.audio.shutdown()
         except Exception:
             self.logger.exception("Chiusura audio non riuscita.")
+        pdf_view = self.views.get("pdf")
+        if pdf_view is not None:
+            try:
+                pdf_view.shutdown()
+            except Exception:
+                self.logger.exception("Chiusura modulo PDF non riuscita.")
         job = self.transcriptions.current_job()
         try:
             self.transcriptions.cancel()

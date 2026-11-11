@@ -17,25 +17,29 @@ from .utils import LOCAL_DATE_FMT, LOCAL_DATETIME_FMT, now_str, safe_float, safe
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Tabelle incluse nel backup JSON. L'ordine e' quello di inserimento: rispetta
-# le foreign key fra calendario, materiali, sessioni e flashcard.
+# le foreign key fra calendario, materiali, note, sessioni, flashcard e dubbi.
 DATA_TABLES: tuple[str, ...] = (
     "settings",
     "subjects",
     "calendar_events",
     "sessions",
     "materials",
+    "material_notes",
     "distraction_attempts",
     "video_lessons",
     "flashcards",
     "flashcard_reviews",
+    "doubts",
     "blocked_sites",
     "blocked_apps",
 )
 
 _RESTORE_DELETE_ORDER: tuple[str, ...] = (
+    "doubts",
+    "material_notes",
     "flashcard_reviews",
     "flashcards",
     "materials",
@@ -54,10 +58,12 @@ _RESTORE_INSERT_ORDER: tuple[str, ...] = (
     "calendar_events",
     "sessions",
     "materials",
+    "material_notes",
     "distraction_attempts",
     "video_lessons",
     "flashcards",
     "flashcard_reviews",
+    "doubts",
     "blocked_sites",
     "blocked_apps",
     "settings",
@@ -92,6 +98,16 @@ CREATE TABLE IF NOT EXISTS materials (
     calendar_event_id INTEGER,
     created_at TEXT NOT NULL,
     FOREIGN KEY (calendar_event_id) REFERENCES calendar_events(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS material_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id INTEGER NOT NULL,
+    page_number INTEGER NOT NULL DEFAULT 1,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (material_id) REFERENCES materials(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS video_lessons (
@@ -142,6 +158,21 @@ CREATE TABLE IF NOT EXISTS flashcard_reviews (
     elapsed_seconds INTEGER NOT NULL DEFAULT 0,
     scheduled_days REAL NOT NULL DEFAULT 0,
     FOREIGN KEY (card_id) REFERENCES flashcards(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS doubts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject TEXT NOT NULL DEFAULT '',
+    material_id INTEGER,
+    page_number INTEGER,
+    question TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+    flashcard_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (material_id) REFERENCES materials(id) ON DELETE SET NULL,
+    FOREIGN KEY (flashcard_id) REFERENCES flashcards(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -195,6 +226,10 @@ CREATE INDEX IF NOT EXISTS idx_attempts_session ON distraction_attempts(session_
 CREATE INDEX IF NOT EXISTS idx_events_start ON calendar_events(start);
 CREATE INDEX IF NOT EXISTS idx_events_end ON calendar_events(end);
 CREATE INDEX IF NOT EXISTS idx_materials_subject ON materials(subject);
+CREATE INDEX IF NOT EXISTS idx_material_notes_material ON material_notes(material_id, page_number);
+CREATE INDEX IF NOT EXISTS idx_doubts_subject ON doubts(subject);
+CREATE INDEX IF NOT EXISTS idx_doubts_material ON doubts(material_id);
+CREATE INDEX IF NOT EXISTS idx_doubts_status ON doubts(status);
 CREATE INDEX IF NOT EXISTS idx_video_lessons_subject ON video_lessons(subject);
 CREATE INDEX IF NOT EXISTS idx_video_lessons_updated ON video_lessons(updated_at);
 CREATE INDEX IF NOT EXISTS idx_flashcards_subject ON flashcards(subject);
@@ -474,6 +509,32 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_materials_for_subject(self, subject: str) -> list[dict[str, Any]]:
+        """Materiali collegati a una materia, ignorando maiuscole e spazi."""
+        rows = self._connection().execute(
+            "SELECT m.*, e.title AS event_title, e.start AS event_start "
+            "FROM materials m LEFT JOIN calendar_events e ON e.id = m.calendar_event_id "
+            "WHERE LOWER(TRIM(m.subject)) = LOWER(TRIM(?)) "
+            "ORDER BY LOWER(m.title)",
+            (str(subject or ""),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_materials_without_subject(self) -> list[dict[str, Any]]:
+        rows = self._connection().execute(
+            "SELECT m.*, e.title AS event_title, e.start AS event_start "
+            "FROM materials m LEFT JOIN calendar_events e ON e.id = m.calendar_event_id "
+            "WHERE TRIM(m.subject) = '' "
+            "ORDER BY LOWER(m.title)"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_materials_without_subject(self) -> int:
+        row = self._connection().execute(
+            "SELECT COUNT(*) AS total FROM materials WHERE TRIM(subject) = ''"
+        ).fetchone()
+        return int(row["total"] if row is not None else 0)
+
     def add_material_hours(self, material_id: int, hours: float) -> None:
         self._connection().execute(
             "UPDATE materials SET logged_hours = MAX(0, logged_hours + ?) WHERE id = ?",
@@ -485,6 +546,217 @@ class Database:
             "UPDATE materials SET logged_hours = ? WHERE id = ?",
             (max(0.0, safe_float(hours)), int(material_id)),
         )
+
+    # -------------------------------------------------------- material notes
+    def add_material_note(self, material_id: int, page_number: int, text: str) -> int:
+        clean = str(text or "").strip()
+        if not clean:
+            raise ValueError("Il testo della nota e' obbligatorio.")
+        page = max(1, safe_int(page_number, 1))
+        timestamp = now_str()
+        cursor = self._connection().execute(
+            "INSERT INTO material_notes(material_id, page_number, text, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?)",
+            (int(material_id), page, clean[:8000], timestamp, timestamp),
+        )
+        return int(cursor.lastrowid)
+
+    def update_material_note(
+        self,
+        note_id: int,
+        text: str,
+        page_number: int | None = None,
+    ) -> None:
+        clean = str(text or "").strip()
+        if not clean:
+            raise ValueError("Il testo della nota e' obbligatorio.")
+        if page_number is None:
+            self._connection().execute(
+                "UPDATE material_notes SET text = ?, updated_at = ? WHERE id = ?",
+                (clean[:8000], now_str(), int(note_id)),
+            )
+            return
+        self._connection().execute(
+            "UPDATE material_notes SET text = ?, page_number = ?, updated_at = ? "
+            "WHERE id = ?",
+            (clean[:8000], max(1, safe_int(page_number, 1)), now_str(), int(note_id)),
+        )
+
+    def delete_material_note(self, note_id: int) -> None:
+        self._connection().execute(
+            "DELETE FROM material_notes WHERE id = ?", (int(note_id),)
+        )
+
+    def get_material_note(self, note_id: int) -> dict[str, Any] | None:
+        row = self._connection().execute(
+            "SELECT * FROM material_notes WHERE id = ?", (int(note_id),)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_material_notes(self, material_id: int | None = None) -> list[dict[str, Any]]:
+        if material_id is None:
+            rows = self._connection().execute(
+                "SELECT n.*, m.title AS material_title FROM material_notes n "
+                "LEFT JOIN materials m ON m.id = n.material_id "
+                "ORDER BY n.material_id, n.page_number, n.created_at"
+            ).fetchall()
+        else:
+            rows = self._connection().execute(
+                "SELECT n.*, m.title AS material_title FROM material_notes n "
+                "LEFT JOIN materials m ON m.id = n.material_id "
+                "WHERE n.material_id = ? "
+                "ORDER BY n.page_number, n.created_at",
+                (int(material_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_material_notes(self, material_id: int) -> int:
+        row = self._connection().execute(
+            "SELECT COUNT(*) AS total FROM material_notes WHERE material_id = ?",
+            (int(material_id),),
+        ).fetchone()
+        return safe_int(row["total"] if row is not None else 0)
+
+    # ----------------------------------------------------------------- doubts
+    def add_doubt(
+        self,
+        subject: str,
+        question: str,
+        source: str = "",
+        material_id: int | None = None,
+        page_number: int | None = None,
+    ) -> int:
+        clean = str(question or "").strip()
+        if not clean:
+            raise ValueError("La domanda o il dubbio e' obbligatorio.")
+        page = None if page_number in (None, "") else max(1, safe_int(page_number, 1))
+        timestamp = now_str()
+        cursor = self._connection().execute(
+            "INSERT INTO doubts(subject, material_id, page_number, question, source, "
+            "status, flashcard_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, ?)",
+            (
+                str(subject or "").strip()[:150],
+                int(material_id) if material_id not in (None, "") else None,
+                page,
+                clean[:8000],
+                str(source or "").strip()[:500],
+                timestamp,
+                timestamp,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def update_doubt(
+        self,
+        doubt_id: int,
+        question: str,
+        source: str = "",
+        subject: str = "",
+        material_id: int | None = None,
+        page_number: int | None = None,
+    ) -> None:
+        clean = str(question or "").strip()
+        if not clean:
+            raise ValueError("La domanda o il dubbio e' obbligatorio.")
+        page = None if page_number in (None, "") else max(1, safe_int(page_number, 1))
+        self._connection().execute(
+            "UPDATE doubts SET subject = ?, material_id = ?, page_number = ?, "
+            "question = ?, source = ?, updated_at = ? WHERE id = ?",
+            (
+                str(subject or "").strip()[:150],
+                int(material_id) if material_id not in (None, "") else None,
+                page,
+                clean[:8000],
+                str(source or "").strip()[:500],
+                now_str(),
+                int(doubt_id),
+            ),
+        )
+
+    def set_doubt_status(self, doubt_id: int, status: str) -> None:
+        clean = str(status or "").strip().lower()
+        if clean not in {"open", "resolved"}:
+            raise ValueError("Stato del dubbio non valido.")
+        self._connection().execute(
+            "UPDATE doubts SET status = ?, updated_at = ? WHERE id = ?",
+            (clean, now_str(), int(doubt_id)),
+        )
+
+    def resolve_doubt_with_flashcard(self, doubt_id: int, flashcard_id: int) -> None:
+        self._connection().execute(
+            "UPDATE doubts SET status = 'resolved', flashcard_id = ?, updated_at = ? "
+            "WHERE id = ?",
+            (int(flashcard_id), now_str(), int(doubt_id)),
+        )
+
+    def delete_doubt(self, doubt_id: int) -> None:
+        self._connection().execute(
+            "DELETE FROM doubts WHERE id = ?", (int(doubt_id),)
+        )
+
+    def get_doubt(self, doubt_id: int) -> dict[str, Any] | None:
+        row = self._connection().execute(
+            "SELECT d.*, m.title AS material_title, m.file_path AS material_path, "
+            "f.front AS flashcard_front FROM doubts d "
+            "LEFT JOIN materials m ON m.id = d.material_id "
+            "LEFT JOIN flashcards f ON f.id = d.flashcard_id "
+            "WHERE d.id = ?",
+            (int(doubt_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_doubts(
+        self,
+        subject: str | None = None,
+        status: str | None = None,
+        material_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if subject is not None and subject.strip():
+            clauses.append("LOWER(d.subject) = LOWER(?)")
+            params.append(subject.strip())
+        if status in {"open", "resolved"}:
+            clauses.append("d.status = ?")
+            params.append(status)
+        if material_id is not None:
+            clauses.append("d.material_id = ?")
+            params.append(int(material_id))
+        sql = (
+            "SELECT d.*, m.title AS material_title, m.file_path AS material_path, "
+            "f.front AS flashcard_front FROM doubts d "
+            "LEFT JOIN materials m ON m.id = d.material_id "
+            "LEFT JOIN flashcards f ON f.id = d.flashcard_id"
+        )
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += (
+            " ORDER BY CASE d.status WHEN 'open' THEN 0 ELSE 1 END, "
+            "d.created_at DESC, d.id DESC"
+        )
+        rows = self._connection().execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def doubt_stats(self, subject: str | None = None) -> dict[str, int]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if subject is not None and subject.strip():
+            clauses.append("LOWER(subject) = LOWER(?)")
+            params.append(subject.strip())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        row = self._connection().execute(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END), 0) AS open, "
+            "COALESCE(SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END), 0) AS resolved "
+            f"FROM doubts{where}",
+            tuple(params),
+        ).fetchone()
+        return {
+            "total": safe_int(row["total"] if row else 0),
+            "open": safe_int(row["open"] if row else 0),
+            "resolved": safe_int(row["resolved"] if row else 0),
+        }
 
     # ------------------------------------------------------------ video lessons
     def add_video_lesson(
@@ -873,9 +1145,9 @@ class Database:
             try:
                 connection.execute(
                     "DELETE FROM sqlite_sequence WHERE name IN "
-                    "('sessions', 'distraction_attempts', 'materials', 'video_lessons', "
-                    "'calendar_events', 'blocked_sites', 'blocked_apps', 'flashcards', "
-                    "'flashcard_reviews')"
+                    "('sessions', 'distraction_attempts', 'materials', 'material_notes', "
+                    "'video_lessons', 'calendar_events', 'blocked_sites', 'blocked_apps', "
+                    "'flashcards', 'flashcard_reviews', 'doubts')"
                 )
             except sqlite3.Error:
                 pass
@@ -926,7 +1198,8 @@ class Database:
             "UNION SELECT subject FROM materials WHERE TRIM(subject) <> '' "
             "UNION SELECT subject FROM sessions WHERE TRIM(subject) <> '' "
             "UNION SELECT subject FROM video_lessons WHERE TRIM(subject) <> '' "
-            "UNION SELECT subject FROM flashcards WHERE TRIM(subject) <> ''"
+            "UNION SELECT subject FROM flashcards WHERE TRIM(subject) <> '' "
+            "UNION SELECT subject FROM doubts WHERE TRIM(subject) <> ''"
             ") "
             "SELECT n.name, COALESCE(s.id, 0) AS subject_id, "
             "COALESCE(s.teacher_name, '') AS teacher_name, "
@@ -944,6 +1217,10 @@ class Database:
             "WHERE LOWER(f.subject) = LOWER(n.name)) AS flashcards, "
             "(SELECT COUNT(*) FROM flashcards f "
             "WHERE LOWER(f.subject) = LOWER(n.name) AND f.due_at <= ?) AS due_flashcards, "
+            "(SELECT COUNT(*) FROM doubts d "
+            "WHERE LOWER(d.subject) = LOWER(n.name) AND d.status = 'open') AS open_doubts, "
+            "(SELECT COUNT(*) FROM doubts d "
+            "WHERE LOWER(d.subject) = LOWER(n.name)) AS doubts, "
             "(SELECT COUNT(*) FROM calendar_events e "
             "WHERE LOWER(e.subject) = LOWER(n.name)) AS events, "
             "(SELECT COUNT(*) FROM sessions se "

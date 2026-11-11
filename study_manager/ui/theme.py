@@ -5,6 +5,7 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from ..config import COLORS, FONT_FAMILY, MONO_FONT_FAMILY
+from .scrolling import install_smooth_scrolling
 
 
 def configure_theme() -> None:
@@ -15,6 +16,7 @@ def configure_theme() -> None:
         ctk.set_window_scaling(1.0)
     except Exception:
         pass
+    install_smooth_scrolling()
 
 
 def font(size: int = 13, weight: str = "normal", family: str = FONT_FAMILY) -> ctk.CTkFont:

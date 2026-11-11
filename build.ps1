@@ -65,6 +65,17 @@ if (-not (Test-Path $exe)) {
     throw "Build terminata ma dist\StudyFlow.exe non esiste."
 }
 
+# Pandoc per l'esportazione Word: copiato accanto all'exe (non dentro, per non
+# estrarre ~150 MB a ogni avvio). StudyFlow lo cerca in quella cartella.
+$pandocSrc = & $venvPython -c "import pypandoc; print(pypandoc.get_pandoc_path())" 2>$null
+if ($LASTEXITCODE -eq 0 -and $pandocSrc -and (Test-Path $pandocSrc)) {
+    Copy-Item $pandocSrc (Join-Path $PSScriptRoot "dist\pandoc.exe") -Force
+    Write-Host "Pandoc copiato in dist\pandoc.exe" -ForegroundColor DarkGray
+}
+else {
+    Write-Host "Pandoc non trovato: l'esportazione .docx richiedera' pandoc nel PATH." -ForegroundColor Yellow
+}
+
 $sizeMb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host ""
 Write-Host "Build completata: $exe ($sizeMb MB)" -ForegroundColor Green

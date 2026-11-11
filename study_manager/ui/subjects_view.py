@@ -19,6 +19,7 @@ from ..services.subjects import (
     parse_exam_date,
 )
 from ..utils import format_hours
+from .materials import ORPHAN_SUBJECT, ORPHAN_SUBJECT_KEY, MaterialsSection
 from .theme import font
 from .widgets import (
     Card,
@@ -27,6 +28,7 @@ from .widgets import (
     center_window,
     clear_children,
     set_window_icon,
+    render_state,
 )
 
 
@@ -124,18 +126,25 @@ class SubjectsView(ctk.CTkFrame):
 
     # ------------------------------------------------------------------ data
     def on_show(self) -> None:
-        self.refresh()
+        # Ricostruisce lista e dettaglio solo se i dati sono cambiati da
+        # quando la sezione e' stata disegnata l'ultima volta.
+        with render_state(self).only_if_changed():
+            self.refresh()
         self._start_countdown()
 
     def on_hide(self) -> None:
         self._stop_countdown()
 
     def refresh_if_visible(self) -> None:
-        if self.winfo_ismapped():
+        if self.app.is_view_visible(self):
             self.refresh()
 
     def refresh(self) -> None:
-        subjects = self.db.list_subjects(self.search_entry.get())
+        search = self.search_entry.get()
+        subjects = self.db.list_subjects(search)
+        orphans = self.db.count_materials_without_subject()
+        if orphans and not search.strip():
+            subjects.append(self._orphan_entry(orphans))
         names = [str(item["name"]) for item in subjects]
         if self._selected is not None:
             match = next(
@@ -152,6 +161,28 @@ class SubjectsView(ctk.CTkFrame):
         self._render_list(subjects)
         self._render_detail()
 
+    @staticmethod
+    def _orphan_entry(count: int) -> dict[str, Any]:
+        return {
+            "name": ORPHAN_SUBJECT_KEY,
+            "display_name": ORPHAN_SUBJECT,
+            "subject_id": 0,
+            "teacher_name": "",
+            "teacher_email": "",
+            "cfu": 0,
+            "hours": 0,
+            "exam_date": "",
+            "notes": "",
+            "materials": count,
+            "videos": 0,
+            "flashcards": 0,
+            "due_flashcards": 0,
+            "events": 0,
+            "sessions": 0,
+            "study_minutes": 0,
+            "orphan": True,
+        }
+
     def _on_search(self, _event: tk.Event | None = None) -> None:
         if self._search_job is not None:
             try:
@@ -166,6 +197,8 @@ class SubjectsView(ctk.CTkFrame):
 
     # ------------------------------------------------------------------ list
     def _render_list(self, subjects: list[dict[str, Any]]) -> None:
+        if not render_state(self).should_render("list", subjects, self._selected):
+            return
         clear_children(self.list_scroll)
         if not subjects:
             empty = ctk.CTkFrame(self.list_scroll, fg_color="transparent")
@@ -192,6 +225,8 @@ class SubjectsView(ctk.CTkFrame):
 
     def _subject_row(self, subject: dict[str, Any], row: int) -> None:
         name = str(subject.get("name") or "")
+        display_name = str(subject.get("display_name") or name)
+        is_orphan = bool(subject.get("orphan"))
         selected = bool(self._selected) and name.casefold() == self._selected.casefold()
         frame = ctk.CTkFrame(
             self.list_scroll,
@@ -205,7 +240,7 @@ class SubjectsView(ctk.CTkFrame):
 
         title = ctk.CTkLabel(
             frame,
-            text=name or "Senza nome",
+            text=display_name or "Senza nome",
             font=font(12, "bold"),
             text_color=COLORS.text,
             anchor="w",
@@ -215,7 +250,10 @@ class SubjectsView(ctk.CTkFrame):
         title.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 2))
 
         cfu = int(subject.get("cfu", 0) or 0)
-        if cfu:
+        if is_orphan:
+            count = int(subject.get("materials", 0) or 0)
+            meta_text = f"{count} materiali da assegnare"
+        elif cfu:
             meta_text = f"{format_cfu(cfu)}  ·  {cfu_to_hours(cfu)} h"
         else:
             meta_text = "CFU e dettagli da impostare"
@@ -232,12 +270,18 @@ class SubjectsView(ctk.CTkFrame):
         badge = ctk.CTkLabel(
             frame,
             text=(
-                f"Esame {countdown['date_label']}"
+                "Apri per assegnare una materia"
+                if is_orphan
+                else f"Esame {countdown['date_label']}"
                 if countdown["defined"]
                 else "Data esame da definire"
             ),
             font=font(9, "bold"),
-            text_color=COUNTDOWN_COLORS.get(str(countdown["status"]), COLORS.text_muted),
+            text_color=(
+                COLORS.amber
+                if is_orphan
+                else COUNTDOWN_COLORS.get(str(countdown["status"]), COLORS.text_muted)
+            ),
             fg_color=COLORS.surface,
             corner_radius=6,
             padx=7,
@@ -251,11 +295,25 @@ class SubjectsView(ctk.CTkFrame):
 
     # ------------------------------------------------------------------ detail
     def _render_detail(self) -> None:
+        from datetime import date
+
+        selected = self._selected
+        if selected == ORPHAN_SUBJECT_KEY:
+            detail_data: Any = self.db.list_materials_without_subject()
+        elif selected:
+            detail_data = (self.db.get_subject(selected), self.db.list_materials_for_subject(selected))
+        else:
+            detail_data = None
+        if not render_state(self).should_render("detail", selected, detail_data, date.today().isoformat()):
+            return
         clear_children(self.detail_scroll)
         self._countdown_label = None
         self._countdown_date = ""
         if not self._selected:
             self._empty_detail()
+            return
+        if self._selected == ORPHAN_SUBJECT_KEY:
+            self._orphan_detail()
             return
         subject = self.db.get_subject(self._selected)
         if subject is None:
@@ -263,10 +321,71 @@ class SubjectsView(ctk.CTkFrame):
             return
         self._detail_header(subject)
         self._detail_countdown(subject)
+        self._detail_materials(subject)
         self._detail_stats(subject)
         self._detail_teacher(subject)
         self._detail_links(subject)
         self._detail_notes(subject)
+
+    def _orphan_detail(self) -> None:
+        header = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(2, 12))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header,
+            text="MATERIALI DA ASSEGNARE",
+            font=font(9, "bold"),
+            text_color=COLORS.text_faint,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            header,
+            text=ORPHAN_SUBJECT,
+            font=font(26, "bold"),
+            text_color=COLORS.text,
+            anchor="w",
+            wraplength=440,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 6))
+        ctk.CTkLabel(
+            header,
+            text=(
+                "Questi materiali non hanno ancora una materia. Apri "
+                "Modifica su un materiale per assegnarlo: una volta collegato, "
+                "sparirà da qui e comparirà nella pagina della materia scelta."
+            ),
+            font=font(11),
+            text_color=COLORS.text_muted,
+            anchor="w",
+            wraplength=440,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w")
+
+        section = MaterialsSection(
+            self.detail_scroll,
+            self.app,
+            "",
+            on_change=self.refresh,
+            allow_add=False,
+            allow_subject_change=True,
+        )
+        section.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+        note = Card(self.detail_scroll)
+        note.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        ctk.CTkLabel(
+            note,
+            text=(
+                "Suggerimento: puoi assegnare il materiale a una materia "
+                "esistente oppure scrivere il nome di una nuova materia. "
+                "La pagina materia verrà creata automaticamente."
+            ),
+            font=font(10),
+            text_color=COLORS.text_faint,
+            anchor="w",
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w", padx=20, pady=14)
 
     def _empty_detail(self) -> None:
         card = Card(self.detail_scroll)
@@ -429,7 +548,7 @@ class SubjectsView(ctk.CTkFrame):
         study_hours = study_minutes / 60.0
         percent = min(100, int(round(study_hours / hours * 100))) if hours else 0
         stats = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-        stats.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        stats.grid(row=3, column=0, sticky="ew", pady=(0, 12))
         for column in range(2):
             stats.grid_columnconfigure(column, weight=1, uniform="subject_stats")
 
@@ -468,9 +587,18 @@ class SubjectsView(ctk.CTkFrame):
         )
         cards_card.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
 
+    def _detail_materials(self, subject: dict[str, Any]) -> None:
+        section = MaterialsSection(
+            self.detail_scroll,
+            self.app,
+            str(subject.get("name") or ""),
+            on_change=self.refresh,
+        )
+        section.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+
     def _detail_teacher(self, subject: dict[str, Any]) -> None:
         card = Card(self.detail_scroll)
-        card.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        card.grid(row=4, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             card,
@@ -517,7 +645,7 @@ class SubjectsView(ctk.CTkFrame):
 
     def _detail_links(self, subject: dict[str, Any]) -> None:
         card = Card(self.detail_scroll)
-        card.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        card.grid(row=5, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             card,
@@ -558,7 +686,7 @@ class SubjectsView(ctk.CTkFrame):
         if not notes:
             return
         card = Card(self.detail_scroll)
-        card.grid(row=5, column=0, sticky="ew", pady=(0, 4))
+        card.grid(row=6, column=0, sticky="ew", pady=(0, 4))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             card,
@@ -629,7 +757,7 @@ class SubjectsView(ctk.CTkFrame):
 
     def _tick_countdown(self) -> None:
         self._countdown_job = None
-        if not self.winfo_ismapped():
+        if not self.app.is_view_visible(self):
             return
         if self._countdown_label is not None and self._selected:
             subject = self.db.get_subject(self._selected)

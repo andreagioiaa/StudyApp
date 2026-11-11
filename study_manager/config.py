@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 APP_NAME = "StudyFlow"
 APP_TITLE = "StudyFlow - Gestionale Studio & Analytics"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.2"
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "pomodoro_work": "25",

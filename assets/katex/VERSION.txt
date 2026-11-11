@@ -1,0 +1,1 @@
+KaTeX 0.16.47 (MIT) - copia locale per l'anteprima offline. Solo font woff2.

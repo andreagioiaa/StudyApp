@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import tkinter as tk
-from typing import Iterable
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator
 
 import customtkinter as ctk
 
@@ -82,6 +83,12 @@ class StatCard(Card):
         self._subtitle.grid(row=3, column=0, sticky="ew", padx=16, pady=(1, 14))
 
     def set(self, value: str, subtitle: str | None = None, accent: str | None = None) -> None:
+        # Riconfigurare un widget CTk lo ridisegna anche a parita' di testo:
+        # se nulla cambia non si tocca niente.
+        signature = (value, subtitle, accent)
+        if signature == getattr(self, "_last_set", None):
+            return
+        self._last_set = signature
         self._value.configure(text=value)
         if subtitle is not None:
             self._subtitle.configure(text=subtitle)
@@ -171,6 +178,61 @@ class TimerRing(tk.Canvas):
             fill=COLORS.text_muted,
             font=(FONT_FAMILY, 10, "bold"),
         )
+
+
+class RenderState:
+    """Ricorda quali dati sono attualmente disegnati in una sezione di una vista.
+
+    Le viste restano in memoria dopo la prima apertura, ma ``on_show``
+    ricostruiva comunque liste e dettagli con ``clear_children``: l'area restava
+    vuota per un istante e poi veniva ridisegnata (sfarfallio al cambio di
+    sezione). Ogni funzione di disegno registra la firma dei dati che mostra;
+    durante ``on_show`` (contesto ``only_if_changed``) la ricostruzione viene
+    saltata se la firma e' identica a quella gia' a schermo.
+
+    Fuori da ``on_show`` le azioni dell'utente ricostruiscono sempre, cosi'
+    nessun comportamento esistente cambia (per esempio "Annulla" che ripristina
+    un campo modificato).
+    """
+
+    def __init__(self) -> None:
+        self._signatures: dict[str, str] = {}
+        self._lazy_depth = 0
+
+    @staticmethod
+    def signature(*parts: Any) -> str:
+        return repr(parts)
+
+    @contextmanager
+    def only_if_changed(self) -> Iterator[None]:
+        self._lazy_depth += 1
+        try:
+            yield
+        finally:
+            self._lazy_depth -= 1
+
+    def should_render(self, key: str, *parts: Any) -> bool:
+        """True se la sezione va (ri)disegnata; registra sempre la nuova firma."""
+        value = self.signature(*parts)
+        if self._lazy_depth and self._signatures.get(key) == value:
+            return False
+        self._signatures[key] = value
+        return True
+
+    def forget(self, key: str | None = None) -> None:
+        if key is None:
+            self._signatures.clear()
+        else:
+            self._signatures.pop(key, None)
+
+
+def render_state(widget) -> RenderState:
+    """``RenderState`` associato a una vista (creato al primo uso)."""
+    state = getattr(widget, "_studyflow_render_state", None)
+    if state is None:
+        state = RenderState()
+        widget._studyflow_render_state = state
+    return state
 
 
 def clear_children(widget) -> None:

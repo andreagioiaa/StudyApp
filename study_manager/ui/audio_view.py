@@ -37,6 +37,7 @@ from .widgets import (
     clear_children,
     separator,
     set_window_icon,
+    render_state,
 )
 
 
@@ -657,7 +658,8 @@ class AudioView(ctk.CTkFrame):
 
     # --------------------------------------------------------------- lifecycle
     def on_show(self) -> None:
-        self._refresh_library()
+        with render_state(self).only_if_changed():
+            self._refresh_library()
         self._load_preferences()
         self._refresh_ffmpeg()
         self._refresh_player()
@@ -849,6 +851,12 @@ class AudioView(ctk.CTkFrame):
             selected = NO_TRACK
         self.track_combo.set(selected)
 
+        player = self.audio.status()
+        if not render_state(self).should_render(
+            "library", tracks, str(player["current"] or ""), bool(player["playing"])
+        ):
+            self._refresh_focus_buttons()
+            return
         clear_children(self.library_body)
         if not tracks:
             ctk.CTkLabel(

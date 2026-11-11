@@ -46,13 +46,18 @@ per l'elaborazione o la sincronizzazione dei dati.
   all'evento.
 - Svuotamento del calendario importato.
 
-### Materiali
-- Registrazione di PDF, documenti e note con materia, file e ore previste.
+### Materiali dentro le materie
+- I PDF, i documenti e le note non hanno piu' una sezione autonoma: ogni
+  materiale vive nella pagina della materia a cui appartiene.
+- Registrazione di titolo, file e ore previste direttamente dalla pagina materia.
 - Collegamento opzionale a un evento del calendario.
 - Avanzamento ore registrate / ore previste con barra di progresso.
 - Aggiornamento automatico delle ore quando si studia da un materiale.
 - Aggiunta manuale di ore.
 - Apertura del file con il programma predefinito di Windows (es. lettore PDF).
+- I materiali creati prima di questa versione senza materia restano raggiungibili
+  da una voce temporanea **Materiali senza materia**, finche' non vengono
+  assegnati.
 
 ### Materie, CFU ed esami
 - Pagina dedicata per ogni materia con docente, email, CFU, monte ore, data
@@ -115,6 +120,25 @@ per l'elaborazione o la sincronizzazione dei dati.
 - Stati e recupero automatico dei job interrotti; il video originale non viene
   copiato ne' modificato.
 
+### PDF e Slide
+- Trascrizione di slide e dispense PDF in **.txt**, **.tex** (corpo o documento
+  completo compilabile) e **.docx** con equazioni native di Word (OMML).
+- Testo vettoriale con PyMuPDF (pdfplumber come alternativa), OCR locale con
+  Tesseract o PaddleOCR per i PDF scansionati, Marker o Nougat facoltativi per le
+  pagine con formule complesse.
+- Ricostruzione delle formule dai PDF LaTeX/Beamer (frazioni, limiti, apici,
+  pedici, radici, `\mathbb`, `\vec`) e dai simboli Unicode di PowerPoint/Word.
+- Marcatori `=== SLIDE N ===` / `% === Slide N ===`, elenchi puntati e numerati
+  annidati, rimozione di intestazioni ripetute, numeri di pagina e sillabazioni.
+- Editor con anteprima live affiancata (formule renderizzate in locale), viste
+  del LaTeX e del TXT finali, modifica in Markdown o direttamente in LaTeX.
+- Singolo file o cartella intera (batch), barra di avanzamento e annullamento,
+  copia del LaTeX negli appunti, anteprima KaTeX offline nel browser.
+- **Rimuovi testo** (Ctrl+H): toglie il testo ridondante anche dopo
+  l'estrazione, come un "sostituisci tutto" con sostituzione vuota, sul
+  documento aperto o su tutti; le regole possono essere ricordate e applicate
+  alle estrazioni successive.
+
 ### Analisi
 - KPI per oggi, settimana e mese.
 - Quality Score 0-100%.
@@ -150,6 +174,11 @@ per l'elaborazione o la sincronizzazione dei dati.
   `winget install Gyan.FFmpeg`.
 - Per la trascrizione non serve una GPU: il motore `whisper.cpp` usa la CPU. Il
   modello predefinito occupa circa 60 MB e viene scaricato una sola volta.
+- Per **PDF e Slide**: PyMuPDF, pdfplumber e pypandoc-binary sono in
+  `requirements.txt`. Facoltativi: **Tesseract-OCR** con la lingua italiana
+  (`winget install UB-Mannheim.TesseractOCR`) per i PDF scansionati, **PaddleOCR**,
+  **Marker** (`pip install marker-pdf`) o **Nougat** (`pip install nougat-ocr`)
+  per le formule complesse. Vedi la sezione 11b.
 - Facoltativo: **Deno** o **Node.js 22+** per la massima compatibilita' con
   l'estrazione YouTube di `yt-dlp`. Se assenti, alcuni video potrebbero non
   esporre tutti i formati audio.
@@ -172,6 +201,9 @@ Dipendenze principali:
 | requests | 2.32.3 |
 | tqdm | 4.67.1 |
 | platformdirs | 4.3.8 |
+| pymupdf | 1.27.2.3 |
+| pdfplumber | 0.11.10 |
+| pypandoc_binary | 1.17 |
 | pyinstaller (solo build) | 6.20.0 |
 
 Le versioni esatte sono in `requirements.txt`. Pygame viene importato solo alla
@@ -229,7 +261,8 @@ StudyApp/
 ├── README.md
 ├── assets/
 │   ├── app.ico                 # icona Windows
-│   └── app.png
+│   ├── app.png
+│   └── katex/                  # KaTeX 0.16 locale (MIT) per l'anteprima HTML
 ├── study_manager/
 │   ├── __init__.py
 │   ├── config.py               # costanti, default, palette, Quality Score
@@ -252,20 +285,33 @@ StudyApp/
 │   │   ├── transcription.py    # whisper.cpp, FFmpeg, modelli e controller
 │   │   ├── spaced_repetition.py # pianificazione SM-2/Anki per le flashcard
 │   │   ├── subjects.py         # CFU, monte ore, date e countdown esami
-│   │   └── backup.py           # export/import ZIP, validazione e ripristino
+│   │   ├── backup.py           # export/import ZIP, validazione e ripristino
+│   │   └── pdf_tools/          # PDF e Slide (nessuna dipendenza dalla GUI)
+│   │       ├── document.py     # blocchi, formato sorgente con === SLIDE N ===
+│   │       ├── extract.py      # PyMuPDF, pdfplumber, OCR, Marker/Nougat
+│   │       ├── layout.py       # titoli, elenchi, paragrafi, pulizia margini
+│   │       ├── mathlayout.py   # ricostruzione geometrica delle formule
+│   │       ├── mathconv.py     # Unicode <-> LaTeX
+│   │       ├── export.py       # .txt, .tex, .docx (Pandoc), HTML KaTeX
+│   │       ├── text_removal.py # "Rimuovi testo": rimozione e regole salvate
+│   │       └── controller.py   # thread di lavoro, batch, annullamento
 │   └── ui/
 │       ├── app.py              # finestra principale, navigazione, polling
 │       ├── pomodoro_view.py
 │       ├── audio_view.py       # lettore, libreria, YouTube, suoni
 │       ├── video_view.py       # archivio video, trascrizione e viewer .txt
+│       ├── pdf_view.py         # PDF e Slide: editor, anteprima live, export
+│       ├── remove_text_dialog.py # finestra "Rimuovi testo" (Ctrl+H)
+│       ├── math_render.py      # formule -> immagini con matplotlib.mathtext
 │       ├── blocker_view.py
 │       ├── calendar_view.py
-│       ├── materials_view.py
+│       ├── materials.py        # materiali dentro la pagina materia e dialogo
 │       ├── subjects_view.py    # pagine materia, docente, CFU ed esami
 │       ├── flashcard_view.py   # archivio flashcard, dialoghi e sessione di studio
 │       ├── analytics_view.py
 │       ├── settings_view.py    # impostazioni e backup/importazione dati
 │       ├── formatting.py
+│       ├── scrolling.py        # rotella fluida e scorrimento annidato
 │       ├── theme.py
 │       └── widgets.py
 └── tests/
@@ -273,7 +319,9 @@ StudyApp/
     ├── test_backup.py
     ├── test_core.py
     ├── test_flashcards.py
+    ├── test_pdf_tools.py
     ├── test_pomodoro.py
+    ├── test_scrolling.py
     ├── test_subjects.py
     └── test_transcription.py
 ```
@@ -441,12 +489,21 @@ non ha elementi collegati.
 
 ### Materiali
 
+I materiali sono gestiti all'interno della pagina della materia: si aprono dalla
+sezione **MATERIALI**, subito sotto il countdown dell'esame. Non esiste piu' una
+voce **Materiali** nella barra di navigazione.
+
 Un materiale contiene:
 
 - titolo, materia e percorso del file;
 - ore previste;
 - evento del calendario opzionale;
 - ore registrate.
+
+Il materiale viene creato e modificato restando collegato alla materia della
+pagina. Se in un backup o in dati precedenti esistono materiali senza materia,
+compare temporaneamente la voce **Materiali senza materia**: aprendo **Modifica**
+si puo' assegnare loro una materia esistente o scriverne una nuova.
 
 Il file originale non viene copiato ne' modificato. Se viene spostato o
 cancellato, StudyFlow mostra "non trovato" e permette comunque di modificare il
@@ -630,6 +687,138 @@ cartella dati scelta.
 
 ---
 
+## 11b. PDF e Slide
+
+La vista **PDF e Slide** converte slide e dispense in testo modificabile. Tutto
+il lavoro avviene sul PC: nessun file viene inviato a servizi esterni.
+
+### Flusso di utilizzo
+
+1. **Apri PDF…** (uno o piu' file) oppure **Apri cartella…** per il batch.
+2. **Estrai testo**: la barra mostra pagina e file in elaborazione; **Annulla**
+   interrompe in sicurezza.
+3. Il testo compare nell'editor a sinistra, l'anteprima a destra si aggiorna a
+   ogni modifica. Con il selettore **Anteprima / LaTeX / TXT** si vede il
+   risultato finale di ciascun formato; **Affiancati / Sovrapposti** cambia la
+   disposizione.
+4. **Copia LaTeX**, **.txt / .tex / .docx** per il documento aperto, oppure
+   **Esporta tutti…** per salvare l'intero batch in una cartella.
+
+### Motori
+
+| Caso | Motore | Note |
+|---|---|---|
+| PDF vettoriali (PowerPoint, Word, LaTeX, Beamer) | PyMuPDF | predefinito, veloce |
+| Alternativa | pdfplumber | usato se PyMuPDF manca o scelto a mano |
+| Pagine scansionate | Tesseract (TSV) o PaddleOCR | in automatico se una pagina ha immagini ma non testo |
+| Formule complesse | Marker o Nougat | solo pagine con formule oppure tutte |
+
+Tesseract viene cercato nel `PATH`, in `C:\Program Files\Tesseract-OCR`, nella
+cartella dati (`tesseract\tesseract.exe`) o nella variabile `STUDYFLOW_TESSERACT`.
+Le lingue (`ita+eng`) vengono ridotte a quelle installate.
+
+Marker e Nougat sono CLI basate su PyTorch, quindi non sono incluse nell'exe: si
+installano a parte (anche in un altro ambiente Python) e si indica il comando
+nella scheda **Motori**. I segnaposto sono `{input_dir}`, `{output_dir}` e
+`{inputs}`; i predefiniti sono:
+
+```text
+marker {input_dir} --output_dir {output_dir}
+nougat {inputs} -o {output_dir} --no-skipping
+```
+
+Ogni pagina selezionata viene salvata come PDF singolo e il motore viene avviato
+una sola volta su tutti i file, cosi' il modello si carica una volta e ogni output
+resta associato alla sua slide. Se il motore fallisce, StudyFlow usa il
+riconoscimento integrato e lo segnala sotto l'editor. Al primo avvio Marker e
+Nougat scaricano i propri modelli: e' un comportamento loro, attivato solo se
+scelti esplicitamente.
+
+### Riconoscimento delle formule integrato
+
+- PDF da LaTeX/Beamer: i glifi dei font matematici (Computer Modern, AMS, CMEX)
+  vengono ricomposti in base alla posizione: apici e pedici dalla dimensione e
+  dallo spostamento verticale, frazioni da numeratore e denominatore sovrapposti,
+  limiti di `\int` e `\sum` dai glifi sopra/sotto il simbolo, radice fino al
+  primo simbolo di relazione, `\mathbb`, `\mathcal`, `\vec`, nomi di funzione
+  (`\lim`, `\sin`...). I frammenti che PyMuPDF separa su righe diverse vengono
+  riuniti alla riga principale.
+- PDF da PowerPoint/Word: i simboli Unicode (`α`, `≤`, `x²`, `½`) diventano
+  LaTeX quando formano una formula; frecce e puntini nella prosa restano testo.
+- Una riga composta solo da una formula diventa `$$...$$`; i numeri di
+  equazione `(1)` restano accanto come `\qquad (1)`.
+
+Il riconoscimento euristico copre bene le formule tipiche delle slide; per
+matrici, sistemi e allineamenti complessi conviene Marker o Nougat, oppure una
+correzione rapida nell'editor.
+
+### Formato dell'editor
+
+```text
+=== SLIDE 1 ===
+
+# Titolo della slide
+
+Testo con formula inline $E = mc^{2}$ e un dollaro letterale \$.
+
+- punto elenco
+  - punto annidato
+1. elenco numerato
+
+$$
+\int_{0}^{1} x^{2}\,dx = \frac{1}{3}
+$$
+```
+
+Con **Modifica in: LaTeX** l'editor contiene direttamente il corpo LaTeX; il
+ritorno a Markdown riconverte i comandi noti e lascia gli altri come testo.
+
+### Esportazione
+
+- **.txt**: testo pulito diviso con `=== SLIDE N ===`; le formule semplici
+  diventano leggibili (`\alpha^{2}` -> `α²`).
+- **.tex**: corpo (`% === Slide N ===`, `\section*`, `itemize`, `enumerate`,
+  `\[ ... \]`) oppure documento completo `article` con `amsmath`, `amssymb`,
+  `babel` italiano. Le formule display usano `\[ ... \]`, la forma raccomandata
+  da amsmath ed equivalente a `$$ ... $$`.
+- **.docx**: Pandoc locale; `$...$` e `$$...$$` diventano equazioni native
+  di Word, titoli con gli stili Titolo 1/2, elenchi Word, marcatori di slide con
+  lo stile "Slide Marker". Opzione per una nuova pagina a ogni slide. Per usare
+  stili personalizzati basta copiare un modello Word in
+  `%LOCALAPPDATA%\StudyFlow\pdf_reference.docx`.
+- Le opzioni **Marcatori e numeri di slide**, **Titoli delle slide** e
+  **Preambolo LaTeX** valgono per anteprima, copia ed esportazione.
+
+### Rimuovi testo
+
+Il pulsante **✂ Rimuovi testo** (o **Ctrl+H** nell'editor) apre una finestra
+che elimina tutte le occorrenze di un testo ridondante (nome del corso, docente,
+copyright, "Pag. N"...) dal sorgente, quindi da anteprima, copia ed export.
+
+- Se nell'editor c'e' una selezione, diventa il testo da cercare.
+- Le occorrenze vengono contate ed evidenziate nell'editor mentre scrivi.
+- Opzioni: maiuscole/minuscole, parola intera, espressione regolare (es.
+  `^Pag\. \d+$`), spazi e a capo flessibili (uno spazio cercato corrisponde
+  anche a un a capo, utile quando il PDF spezza le righe in punti diversi).
+- **Elimina righe, punti elenco e titoli rimasti vuoti**: pulisce doppi spazi,
+  separatori orfani (`Titolo - Prof. X` -> `Titolo`) e righe svuotate.
+- Ambito: documento aperto o tutti i documenti estratti.
+- I marcatori `=== SLIDE N ===` non vengono mai toccati.
+- **Annulla rimozione** ripristina tutti i documenti modificati; sul documento
+  aperto funziona anche Ctrl+Z.
+- **Ricorda e applica alle prossime estrazioni** salva la regola: con l'opzione
+  in *Pulizia e struttura* attiva viene applicata in automatico a ogni nuovo PDF.
+
+### Anteprima
+
+L'anteprima interna disegna le formule con `matplotlib.mathtext` (offline, gia'
+tra le dipendenze); le formule non supportate da mathtext (ambienti
+`\begin{...}`, righe multiple) appaiono come codice evidenziato. **Anteprima
+KaTeX** apre nel browser una pagina HTML che usa il bundle KaTeX incluso in
+`assets/katex`, senza connessione.
+
+---
+
 ## 12. Flashcard e ripetizione spaziata
 
 La vista **Flashcard** mantiene un archivio di schede collegate alle materie gia'
@@ -805,7 +994,7 @@ Copertura attuale:
 - esportazione ZIP, validazione degli archivi, importazione sostitutiva e backup
   di sicurezza.
 
-La suite attuale contiene **49 test**.
+La suite attuale contiene **55 test**.
 
 Smoke test automatico (usa una cartella dati temporanea e non richiede UAC):
 
@@ -942,7 +1131,7 @@ Get-Item .\dist\StudyFlow.exe | Select-Object Name, Length, VersionInfo
 (Get-Item .\dist\StudyFlow.exe).VersionInfo.FileVersion
 ```
 
-La versione attesa per questa release e' `1.4.0.0`. Se si distribuisce l'exe a un
+La versione attesa per questa release e' `1.4.2.0`. Se si distribuisce l'exe a un
 altro PC, non serve Python: servono solo `StudyFlow.exe` e i permessi utente
 normali. Il guardiano hosts viene avviato dallo stesso exe con l'argomento
 interno `--hosts-guard`. Per il download YouTube e per la trascrizione serve
@@ -1044,6 +1233,12 @@ Node.js 22+. StudyFlow rileva automaticamente `deno`, `node`, `bun` e `qjs` nel
 `PATH`. Alcuni video privati, con restrizioni di eta' o geografiche non sono
 scaricabili.
 
+### Lo scorrimento con la rotella e' lento o a scatti
+StudyFlow usa uno scorrimento di circa tre righe (60 pixel) per scatto e sceglie
+sempre l'area piu' interna sotto il puntatore, quindi le liste annidate non
+scorrono piu' insieme alla pagina che le contiene. Anche i mouse e i touchpad ad
+alta risoluzione, che inviano delta piccoli, producono uno spostamento visibile.
+
 ### Non si sente l'audio
 Controllare il volume di Windows, selezionare un dispositivo di output attivo e
 premere **Riproduci**. Se il mixer non riesce a inizializzarsi, la vista Audio
@@ -1056,6 +1251,26 @@ mostra l'errore e il pulsante **Riprova**; i dettagli sono in `studyflow.log`.
 ```
 
 Avviare con `python main.py --debug` per il livello DEBUG.
+
+### PDF e Slide: l'esportazione .docx non e' disponibile
+
+Serve Pandoc. Da sorgente lo fornisce `pypandoc_binary` (in `requirements.txt`);
+con l'eseguibile, `build.ps1` copia `pandoc.exe` accanto a `StudyFlow.exe`. In
+alternativa si puo' installare Pandoc nel `PATH` o copiare `pandoc.exe` nella
+cartella dati.
+
+### PDF e Slide: le pagine scansionate restano vuote
+
+Installa Tesseract-OCR con la lingua italiana oppure PaddleOCR, poi premi
+**Aggiorna** nella scheda Motori: il pallino diventa verde quando il motore e'
+disponibile. Con **Forza OCR su ogni pagina** si puo' ignorare il testo
+vettoriale di PDF con codifica dei caratteri difettosa.
+
+### PDF e Slide: una formula e' ricostruita male
+
+Correggila nell'editor (l'anteprima si aggiorna subito) oppure riesegui
+l'estrazione con Marker o Nougat limitati alle pagine con formule.
+
 
 ---
 

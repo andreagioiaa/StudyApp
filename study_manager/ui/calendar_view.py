@@ -22,7 +22,7 @@ from .formatting import (
     format_week_range,
 )
 from .theme import font
-from .widgets import Card, PageHeader, clear_children
+from .widgets import Card, PageHeader, clear_children, render_state
 
 
 class CalendarView(ctk.CTkFrame):
@@ -165,7 +165,8 @@ class CalendarView(ctk.CTkFrame):
 
     # ------------------------------------------------------------------ data
     def on_show(self) -> None:
-        self._refresh()
+        with render_state(self).only_if_changed():
+            self._refresh()
 
     def _today(self) -> None:
         self._anchor = date.today()
@@ -192,7 +193,6 @@ class CalendarView(ctk.CTkFrame):
         )
 
     def _refresh(self) -> None:
-        clear_children(self.events_scroll)
         start, end = self._bounds()
         if self._mode == "week":
             self.period_label.configure(text=format_week_range(start.date(), end.date()))
@@ -201,6 +201,9 @@ class CalendarView(ctk.CTkFrame):
         events = self.db.get_events(
             start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
         )
+        if not render_state(self).should_render("events", self._mode, self._anchor, events, date.today()):
+            return
+        clear_children(self.events_scroll)
         if not events:
             empty = Card(self.events_scroll)
             empty.grid(row=0, column=0, sticky="ew", pady=(4, 0))

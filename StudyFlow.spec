@@ -8,11 +8,18 @@ from PyInstaller.utils.hooks import collect_data_files, copy_metadata, get_packa
 datas = [
     ("assets/app.ico", "assets"),
     ("assets/app.png", "assets"),
+    # KaTeX locale per l'anteprima HTML offline del modulo PDF e Slide.
+    ("assets/katex", "assets/katex"),
 ]
 datas += collect_data_files("customtkinter")
 # Su Windows zoneinfo/dateutil usano il pacchetto tzdata per i fusi orari:
 # senza i suoi file .zi le ricorrenze ICS con fuso orario fallirebbero nell'exe.
 datas += collect_data_files("tzdata")
+# pdfplumber legge la propria versione dai metadati.
+try:
+    datas += copy_metadata("pdfplumber")
+except Exception:
+    pass
 # pywhispercpp.model legge la versione da importlib.metadata all'import:
 # senza il dist-info l'import fallirebbe dentro l'exe one-file.
 datas += copy_metadata("pywhispercpp")
@@ -35,6 +42,12 @@ except Exception:
     pass
 
 hiddenimports = [
+    "pymupdf",
+    "fitz",
+    "pdfplumber",
+    "pdfminer",
+    "pdfminer.high_level",
+    "pypandoc",
     "matplotlib.backends.backend_tkagg",
     "matplotlib.backends._backend_tk",
     "psutil",

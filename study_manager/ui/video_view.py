@@ -36,6 +36,7 @@ from .widgets import (
     clear_children,
     separator,
     set_window_icon,
+    render_state,
 )
 
 
@@ -251,7 +252,27 @@ class VideoView(ctk.CTkFrame):
 
     # ------------------------------------------------------------------ data
     def on_show(self) -> None:
-        self.refresh()
+        with render_state(self).only_if_changed():
+            self.refresh()
+
+    def _job_lesson_id(self) -> int | None:
+        job = self.transcriptions.current_job()
+        try:
+            return int(job["lesson_id"]) if job else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _detail_signature(self) -> tuple:
+        lesson = self.db.get_video_lesson(self._selected_id) if self._selected_id is not None else None
+        files = []
+        for key in ("video_path", "transcript_path"):
+            value = str((lesson or {}).get(key) or "")
+            try:
+                stat = Path(value).stat() if value else None
+                files.append((stat.st_mtime_ns, stat.st_size) if stat else None)
+            except OSError:
+                files.append(None)
+        return (self._selected_id, lesson, tuple(files), self._job_lesson_id())
 
     def refresh(self) -> None:
         subjects = self.db.list_subject_tags()
@@ -311,29 +332,30 @@ class VideoView(ctk.CTkFrame):
         previous = self._selected_id
         if self._selected_id not in visible_ids:
             self._selected_id = int(lessons[0]["id"]) if lessons else None
-        clear_children(self.list_scroll)
-        if not lessons:
-            empty = ctk.CTkFrame(self.list_scroll, fg_color="transparent")
-            empty.grid(row=0, column=0, sticky="ew", padx=8, pady=18)
-            ctk.CTkLabel(
-                empty,
-                text="Nessuna videolezione trovata.",
-                font=font(12, "bold"),
-                text_color=COLORS.text_muted,
-                anchor="w",
-            ).pack(anchor="w")
-            ctk.CTkLabel(
-                empty,
-                text="Aggiungi un video oppure modifica il filtro per materia.",
-                font=font(10),
-                text_color=COLORS.text_faint,
-                anchor="w",
-                wraplength=300,
-                justify="left",
-            ).pack(anchor="w", pady=(3, 0))
-        else:
-            for index, lesson in enumerate(lessons):
-                self._lesson_card(lesson, index)
+        if render_state(self).should_render("list", lessons, self._selected_id, self._job_lesson_id()):
+            clear_children(self.list_scroll)
+            if not lessons:
+                empty = ctk.CTkFrame(self.list_scroll, fg_color="transparent")
+                empty.grid(row=0, column=0, sticky="ew", padx=8, pady=18)
+                ctk.CTkLabel(
+                    empty,
+                    text="Nessuna videolezione trovata.",
+                    font=font(12, "bold"),
+                    text_color=COLORS.text_muted,
+                    anchor="w",
+                ).pack(anchor="w")
+                ctk.CTkLabel(
+                    empty,
+                    text="Aggiungi un video oppure modifica il filtro per materia.",
+                    font=font(10),
+                    text_color=COLORS.text_faint,
+                    anchor="w",
+                    wraplength=300,
+                    justify="left",
+                ).pack(anchor="w", pady=(3, 0))
+            else:
+                for index, lesson in enumerate(lessons):
+                    self._lesson_card(lesson, index)
         if update_detail or previous != self._selected_id:
             self._render_detail()
 
@@ -438,6 +460,8 @@ class VideoView(ctk.CTkFrame):
 
     # ----------------------------------------------------------------- detail
     def _render_detail(self) -> None:
+        if not render_state(self).should_render("detail", *self._detail_signature()):
+            return
         clear_children(self.detail_host)
         self._detail_progress = None
         self._detail_status = None
@@ -984,7 +1008,7 @@ class VideoView(ctk.CTkFrame):
             self.app.toast("Trascrizione annullata.")
         else:
             self.app.toast("Trascrizione non riuscita.")
-            if self.winfo_ismapped():
+            if self.app.is_view_visible(self):
                 messagebox.showerror(
                     "Trascrizione non riuscita",
                     error,

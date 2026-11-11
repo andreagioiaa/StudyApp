@@ -191,6 +191,22 @@ class SubjectDatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.list_materials()[0]["subject"], "Fisica")
         self.assertEqual(self.db.list_subject_tags(), ["Fisica"])
 
+    def test_materials_are_scoped_to_subject(self) -> None:
+        self.db.add_material("Analisi 1", "", "Analisi Matematica", 8)
+        self.db.add_material("Analisi 2", "", "analisi matematica", 4)
+        self.db.add_material("Fisica", "", "Fisica", 6)
+        self.db.add_material("Senza materia", "", "", 2)
+
+        analisi = self.db.list_materials_for_subject("Analisi Matematica")
+        self.assertEqual([item["title"] for item in analisi], ["Analisi 1", "Analisi 2"])
+        fisica = self.db.list_materials_for_subject("Fisica")
+        self.assertEqual(len(fisica), 1)
+        self.assertEqual(self.db.list_materials_for_subject("Chimica"), [])
+        orphans = self.db.list_materials_without_subject()
+        self.assertEqual([item["title"] for item in orphans], ["Senza materia"])
+        self.assertEqual(self.db.count_materials_without_subject(), 1)
+        self.assertEqual(len(self.db.list_materials()), 4)
+
     def test_duplicate_rename_and_delete_guard(self) -> None:
         self.db.save_subject("Storia")
         self.db.save_subject("Filosofia")
