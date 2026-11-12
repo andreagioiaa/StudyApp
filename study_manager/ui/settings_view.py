@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -17,10 +18,20 @@ from ..services.backup import (
     import_backup,
     inspect_backup,
 )
+from ..services.calendar_sync import (
+    SETTING_AUTO_CREATE,
+    SETTING_FUTURE_DAYS,
+    SETTING_PAST_DAYS,
+    format_elapsed,
+)
+from ..services.google_auth import GoogleAuthError
 from ..services.uac import is_admin
 from ..utils import safe_float, safe_int
 from .theme import font
-from .widgets import Card, PageHeader, separator
+from .widgets import Card, PageHeader, clear_children, separator
+
+
+NO_SUBJECT_CHOICE = "— Nessuna (materia dal titolo) —"
 
 
 class SettingsView(ctk.CTkFrame):
@@ -56,6 +67,10 @@ class SettingsView(ctk.CTkFrame):
         self._build_behavior_card(content)
         self._build_storage_card(content)
         self._build_backup_card(content)
+        self._build_google_card(content)
+        self._connecting = False
+        self._cancel_connect: threading.Event | None = None
+        self._calendar_rows: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ layout
     def _build_timer_card(self, parent) -> None:
@@ -381,6 +396,405 @@ class SettingsView(ctk.CTkFrame):
             command=self._import_data,
         ).pack(side="left")
 
+    def _build_google_card(self, parent) -> None:
+        card = Card(parent)
+        card.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            card,
+            text="Google Calendar",
+            font=font(16, "bold"),
+            text_color=COLORS.text,
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(18, 4))
+        ctk.CTkLabel(
+            card,
+            text=(
+                "Sincronizzazione bidirezionale con i tuoi calendari Google. Serve un "
+                "credentials.json di tipo \"App desktop\" creato in Google Cloud Console "
+                "con la Google Calendar API attiva. I token vengono cifrati con Windows "
+                "(DPAPI) e non vengono mai inclusi nei backup."
+            ),
+            font=font(11),
+            text_color=COLORS.text_muted,
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        ).grid(row=1, column=0, sticky="w", padx=22)
+        self.google_status = ctk.CTkLabel(
+            card, text="", font=font(11, "bold"), text_color=COLORS.text_muted, anchor="w"
+        )
+        self.google_status.grid(row=2, column=0, sticky="w", padx=22, pady=(12, 8))
+
+        buttons = ctk.CTkFrame(card, fg_color="transparent")
+        buttons.grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 12))
+        button_style = dict(
+            height=36,
+            font=font(11, "bold"),
+            fg_color=COLORS.surface_alt,
+            hover_color=COLORS.surface_hover,
+            border_width=1,
+            border_color=COLORS.border,
+            text_color=COLORS.text,
+            corner_radius=9,
+        )
+        ctk.CTkButton(
+            buttons, text="Carica credentials.json", width=180,
+            command=self._load_credentials, **button_style,
+        ).pack(side="left", padx=(0, 8))
+        self.connect_btn = ctk.CTkButton(
+            buttons, text="Connetti account", width=150, command=self._toggle_connection,
+            **{**button_style, "fg_color": COLORS.accent, "hover_color": COLORS.accent_hover,
+               "text_color": COLORS.bg, "border_width": 0},
+        )
+        self.connect_btn.pack(side="left", padx=(0, 8))
+        self.refresh_calendars_btn = ctk.CTkButton(
+            buttons, text="Aggiorna elenco calendari", width=190,
+            command=self._refresh_calendar_list, **button_style,
+        )
+        self.refresh_calendars_btn.pack(side="left")
+
+        separator(card).grid(row=4, column=0, sticky="ew", padx=22, pady=(4, 12))
+        ctk.CTkLabel(
+            card,
+            text="Calendari da sincronizzare e materia abbinata",
+            font=font(12, "bold"),
+            text_color=COLORS.text,
+            anchor="w",
+        ).grid(row=5, column=0, sticky="w", padx=22)
+        ctk.CTkLabel(
+            card,
+            text=(
+                "I calendari con lo stesso nome di una materia vengono abbinati in "
+                "automatico. Un calendario senza materia usa il titolo dell'evento."
+            ),
+            font=font(10),
+            text_color=COLORS.text_faint,
+            anchor="w",
+        ).grid(row=6, column=0, sticky="w", padx=22, pady=(0, 8))
+        self.calendars_frame = ctk.CTkFrame(card, fg_color="transparent")
+        self.calendars_frame.grid(row=7, column=0, sticky="ew", padx=22)
+        self.calendars_frame.grid_columnconfigure(2, weight=1)
+
+        options = ctk.CTkFrame(card, fg_color="transparent")
+        options.grid(row=8, column=0, sticky="ew", padx=22, pady=(14, 4))
+        self.past_days_var = ctk.StringVar(value="180")
+        self.future_days_var = ctk.StringVar(value="365")
+        for label, variable in (
+            ("Giorni passati", self.past_days_var),
+            ("Giorni futuri", self.future_days_var),
+        ):
+            ctk.CTkLabel(
+                options, text=label, font=font(11, "bold"), text_color=COLORS.text_muted
+            ).pack(side="left", padx=(0, 6))
+            ctk.CTkEntry(
+                options,
+                textvariable=variable,
+                width=70,
+                height=32,
+                fg_color=COLORS.surface_alt,
+                border_color=COLORS.border,
+                text_color=COLORS.text,
+                font=font(12),
+                corner_radius=8,
+            ).pack(side="left", padx=(0, 18))
+        self.auto_create_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            options,
+            text="Crea un calendario Google per ogni nuova materia",
+            variable=self.auto_create_var,
+            font=font(11),
+            text_color=COLORS.text_muted,
+            progress_color=COLORS.accent,
+            button_color=COLORS.text,
+            button_hover_color=COLORS.text,
+            fg_color=COLORS.border,
+        ).pack(side="left")
+
+        footer = ctk.CTkFrame(card, fg_color="transparent")
+        footer.grid(row=9, column=0, sticky="ew", padx=22, pady=(10, 18))
+        ctk.CTkButton(
+            footer,
+            text="Salva e sincronizza",
+            height=38,
+            width=170,
+            font=font(11, "bold"),
+            fg_color=COLORS.accent,
+            hover_color=COLORS.accent_hover,
+            text_color=COLORS.bg,
+            corner_radius=9,
+            command=self._save_google,
+        ).pack(side="left")
+        self.google_sync_label = ctk.CTkLabel(
+            footer, text="", font=font(10), text_color=COLORS.text_faint
+        )
+        self.google_sync_label.pack(side="left", padx=14)
+
+    # ------------------------------------------------------------- google
+    @property
+    def _sync(self):
+        return self.app.google_sync
+
+    def _render_google(self) -> None:
+        sync = self._sync
+        auth = sync.auth
+        if self._connecting:
+            status, color = "In attesa del consenso nel browser...", COLORS.amber
+            button_text = "Annulla"
+        elif auth.is_connected():
+            email = auth.account_email()
+            status = f"●  Connesso{(' come ' + email) if email else ''}"
+            color = COLORS.green
+            button_text = "Disconnetti"
+        elif auth.has_client():
+            status, color = "●  credentials.json caricato · account non collegato", COLORS.amber
+            button_text = "Connetti account"
+        else:
+            status, color = "●  Non configurato: carica il file credentials.json", COLORS.text_faint
+            button_text = "Connetti account"
+        self.google_status.configure(text=status, text_color=color)
+        self.connect_btn.configure(
+            text=button_text,
+            state="normal" if (auth.has_client() or self._connecting) else "disabled",
+        )
+        self.refresh_calendars_btn.configure(
+            state="normal" if auth.is_connected() and not sync.is_syncing else "disabled"
+        )
+        settings = self.db.get_settings()
+        self.past_days_var.set(settings.get(SETTING_PAST_DAYS, "180"))
+        self.future_days_var.set(settings.get(SETTING_FUTURE_DAYS, "365"))
+        self.auto_create_var.set(self._bool(settings.get(SETTING_AUTO_CREATE, "0")))
+        last = format_elapsed(sync.last_sync_at())
+        self.google_sync_label.configure(
+            text="Sincronizzazione in corso..." if sync.is_syncing else f"Ultima sincronizzazione: {last}"
+        )
+        self._render_calendar_rows()
+
+    def _render_calendar_rows(self) -> None:
+        clear_children(self.calendars_frame)
+        self._calendar_rows = {}
+        sync = self._sync
+        calendars = sync.cached_calendars() if sync.auth.is_connected() else []
+        if not calendars:
+            ctk.CTkLabel(
+                self.calendars_frame,
+                text=(
+                    "Collega l'account per vedere i tuoi calendari."
+                    if not sync.auth.is_connected()
+                    else "Nessun calendario in elenco: premi \"Aggiorna elenco calendari\"."
+                ),
+                font=font(11),
+                text_color=COLORS.text_faint,
+            ).grid(row=0, column=0, columnspan=4, sticky="w", pady=4)
+            return
+        enabled = set(sync.enabled_calendars())
+        mapping = self.db.subject_calendar_map()
+        subjects = self.db.list_subject_tags()
+        choices = [NO_SUBJECT_CHOICE, *subjects]
+        for row, calendar in enumerate(calendars):
+            calendar_id = str(calendar["id"])
+            color = str(calendar.get("backgroundColor") or COLORS.blue)
+            enabled_var = ctk.BooleanVar(value=calendar_id in enabled)
+            ctk.CTkCheckBox(
+                self.calendars_frame,
+                text="",
+                width=24,
+                variable=enabled_var,
+                fg_color=COLORS.accent,
+                hover_color=COLORS.accent_hover,
+                border_color=COLORS.border,
+                checkbox_width=18,
+                checkbox_height=18,
+                corner_radius=5,
+            ).grid(row=row, column=0, padx=(0, 6), pady=3)
+            ctk.CTkFrame(
+                self.calendars_frame,
+                width=18,
+                height=18,
+                fg_color=color,
+                corner_radius=9,
+            ).grid(row=row, column=1, padx=(0, 10), pady=3)
+            readonly = str(calendar.get("accessRole") or "") not in {"owner", "writer"}
+            name = str(calendar.get("summary") or calendar_id)
+            if calendar.get("primary"):
+                name += "  (principale)"
+            if readonly:
+                name += "  · sola lettura"
+            ctk.CTkLabel(
+                self.calendars_frame,
+                text=name,
+                font=font(11),
+                text_color=COLORS.text,
+                anchor="w",
+            ).grid(row=row, column=2, sticky="w", pady=3)
+            current = (mapping.get(calendar_id) or {}).get("name") or NO_SUBJECT_CHOICE
+            subject_var = ctk.StringVar(value=current)
+            ctk.CTkComboBox(
+                self.calendars_frame,
+                values=choices if current in choices else [*choices, current],
+                variable=subject_var,
+                state="readonly",
+                width=250,
+                height=30,
+                font=font(11),
+                dropdown_font=font(11),
+                fg_color=COLORS.surface_alt,
+                border_color=COLORS.border,
+                button_color=COLORS.surface_hover,
+                button_hover_color=COLORS.border,
+                dropdown_fg_color=COLORS.surface,
+                text_color=COLORS.text,
+                corner_radius=8,
+            ).grid(row=row, column=3, sticky="e", pady=3)
+            self._calendar_rows[calendar_id] = {
+                "enabled": enabled_var,
+                "subject": subject_var,
+                "color": color,
+                "mapped": mapping.get(calendar_id, {}).get("name"),
+            }
+
+    def on_sync_event(self, kind: str, data: dict) -> None:
+        if not self.winfo_exists():
+            return
+        if kind in {"sync_started", "sync_finished"}:
+            self._render_google()
+            if kind == "sync_finished" and data.get("error") and data.get("reason") in {"connect", "settings"}:
+                self.google_sync_label.configure(text=f"Errore: {data['error']}")
+
+    def _load_credentials(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(),
+            title="Seleziona credentials.json (client OAuth \"App desktop\")",
+            filetypes=[("Credenziali OAuth", "*.json"), ("Tutti i file", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self._sync.auth.load_credentials_file(path)
+        except GoogleAuthError as exc:
+            messagebox.showerror("Credenziali non valide", str(exc), parent=self.winfo_toplevel())
+            return
+        except Exception as exc:
+            self.app.logger.exception("Caricamento credentials.json non riuscito.")
+            messagebox.showerror("Credenziali non valide", str(exc), parent=self.winfo_toplevel())
+            return
+        self._render_google()
+        self.app.toast("credentials.json caricato. Ora collega l'account.")
+
+    def _toggle_connection(self) -> None:
+        auth = self._sync.auth
+        if self._connecting:
+            if self._cancel_connect is not None:
+                self._cancel_connect.set()
+            return
+        if auth.is_connected():
+            if not messagebox.askyesno(
+                "Disconnettere Google Calendar?",
+                "I token verranno revocati ed eliminati da questo PC. Gli eventi gia' "
+                "sincronizzati restano in StudyFlow; le modifiche in coda verranno inviate "
+                "quando ricolleghi l'account. Continuare?",
+                parent=self.winfo_toplevel(),
+            ):
+                return
+
+            def disconnect_worker() -> None:
+                try:
+                    auth.disconnect(revoke=True)
+                except Exception:
+                    self.app.logger.exception("Disconnessione Google non riuscita.")
+                finally:
+                    self.db.close_current_thread()
+                self.app.post(self._render_google)
+
+            threading.Thread(target=disconnect_worker, name="StudyFlow-GoogleDisconnect", daemon=True).start()
+            return
+        self._connecting = True
+        self._cancel_connect = threading.Event()
+        cancel = self._cancel_connect
+        self._render_google()
+
+        def connect_worker() -> None:
+            error = ""
+            try:
+                auth.authorize(cancel_event=cancel)
+            except Exception as exc:
+                error = str(exc)
+                if not isinstance(exc, GoogleAuthError):
+                    self.app.logger.exception("Collegamento Google non riuscito.")
+            finally:
+                self.db.close_current_thread()
+            self.app.post(lambda: self._connect_done(error))
+
+        threading.Thread(target=connect_worker, name="StudyFlow-GoogleConnect", daemon=True).start()
+
+    def _connect_done(self, error: str) -> None:
+        self._connecting = False
+        self._cancel_connect = None
+        if not self.winfo_exists():
+            return
+        self._render_google()
+        if error:
+            if error != "Collegamento annullato.":
+                messagebox.showerror("Collegamento non riuscito", error, parent=self.winfo_toplevel())
+            return
+        self.app.toast("Account Google collegato. Sincronizzazione in corso...")
+        self._sync.sync_async("connect")
+
+    def _refresh_calendar_list(self) -> None:
+        if not self._sync.sync_async("connect"):
+            self.app.toast("Sincronizzazione gia' in corso.")
+        self._render_google()
+
+    def _save_google(self) -> None:
+        past = safe_int(self.past_days_var.get(), -1)
+        future = safe_int(self.future_days_var.get(), -1)
+        if not 1 <= past <= 3650 or not 1 <= future <= 3650:
+            messagebox.showerror(
+                "Valore non valido",
+                "La finestra di sincronizzazione deve essere tra 1 e 3650 giorni.",
+                parent=self.winfo_toplevel(),
+            )
+            return
+        chosen: dict[str, str] = {}
+        for calendar_id, row in self._calendar_rows.items():
+            subject = row["subject"].get().strip()
+            if not subject or subject == NO_SUBJECT_CHOICE:
+                continue
+            key = subject.casefold()
+            if key in chosen:
+                messagebox.showerror(
+                    "Abbinamento non valido",
+                    f"La materia \"{subject}\" e' abbinata a piu' calendari. "
+                    "Ogni materia puo' avere un solo calendario Google.",
+                    parent=self.winfo_toplevel(),
+                )
+                return
+            chosen[key] = calendar_id
+        try:
+            for calendar_id, row in self._calendar_rows.items():
+                subject = row["subject"].get().strip()
+                if subject and subject != NO_SUBJECT_CHOICE:
+                    self.db.link_subject_calendar(subject, calendar_id, row["color"])
+                elif row["mapped"]:
+                    self.db.unlink_calendar(calendar_id)
+            self._sync.set_enabled_calendars(
+                calendar_id for calendar_id, row in self._calendar_rows.items() if row["enabled"].get()
+            )
+            self.db.set_settings(
+                {
+                    SETTING_PAST_DAYS: str(past),
+                    SETTING_FUTURE_DAYS: str(future),
+                    SETTING_AUTO_CREATE: "1" if self.auto_create_var.get() else "0",
+                }
+            )
+        except Exception as exc:
+            self.app.logger.exception("Salvataggio impostazioni Google non riuscito.")
+            messagebox.showerror("Salvataggio non riuscito", str(exc), parent=self.winfo_toplevel())
+            return
+        if self._sync.is_connected():
+            self._sync.sync_async("settings")
+        self._render_google()
+        self.app.toast("Impostazioni Google Calendar salvate.")
+
     # ------------------------------------------------------------------ actions
     def on_show(self) -> None:
         settings = self.db.get_settings()
@@ -393,6 +807,7 @@ class SettingsView(ctk.CTkFrame):
         self.path_label.configure(text=str(self.paths["db"]))
         size = self.paths["db"].stat().st_size if self.paths["db"].exists() else 0
         self.size_label.configure(text=f"Dimensione database: {size / 1024:.1f} KB")
+        self._render_google()
 
     @staticmethod
     def _bool(value: str) -> bool:

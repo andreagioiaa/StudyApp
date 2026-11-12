@@ -27,7 +27,27 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "audio_loop": "1",
     "transcription_model": "base-q5_1",
     "transcription_language": "it",
+    # Google Calendar (sincronizzazione bidirezionale)
+    "google_sync_past_days": "180",
+    "google_sync_future_days": "365",
+    "google_auto_create_calendar": "0",
+    "google_enabled_calendars": "[]",
 }
+
+# Impostazioni con segreti OAuth: cifrate con DPAPI, mai esportate nel backup
+# ZIP e mai scritte nei log.
+GOOGLE_SECRET_SETTINGS: tuple[str, ...] = (
+    "google_access_token_enc",
+    "google_refresh_token_enc",
+    "google_client_secret_enc",
+)
+# Stato dell'account legato a questo PC: anche questo resta fuori dal backup,
+# altrimenti un ripristino su un altro PC sembrerebbe "connesso" senza token.
+GOOGLE_ACCOUNT_SETTINGS: tuple[str, ...] = GOOGLE_SECRET_SETTINGS + (
+    "google_client_id",
+    "google_token_expiry",
+    "google_account_email",
+)
 
 DEFAULT_BLOCKED_SITES: tuple[str, ...] = (
     "youtube.com",

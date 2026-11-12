@@ -10,6 +10,8 @@ from typing import Any
 import customtkinter as ctk
 
 from ..config import COLORS
+from ..database import normalize_hex
+from ..services.calendar_sync import text_color_for
 from ..services.subjects import (
     MAX_CFU,
     cfu_to_hours,
@@ -488,9 +490,10 @@ class SubjectsView(ctk.CTkFrame):
             wraplength=680,
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(2, 6))
+        self._google_badge(header, subject).grid(row=2, column=0, sticky="w", pady=(0, 8))
 
         actions = ctk.CTkFrame(header, fg_color="transparent")
-        actions.grid(row=2, column=0, sticky="w")
+        actions.grid(row=3, column=0, sticky="w")
         ctk.CTkButton(
             actions,
             text=(
@@ -556,6 +559,37 @@ class SubjectsView(ctk.CTkFrame):
                 corner_radius=8,
                 command=lambda value=dict(subject): self._delete(value),
             ).pack(side="left")
+
+    def _google_badge(self, parent, subject: dict[str, Any]) -> ctk.CTkFrame:
+        """Colore della materia e calendario Google collegato."""
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        color = normalize_hex(subject.get("color_hex"))
+        calendar_id = str(subject.get("google_calendar_id") or "")
+        sync = getattr(self.app, "google_sync", None)
+        info = sync.calendar_info(calendar_id) if (sync is not None and calendar_id) else None
+        if color:
+            ctk.CTkFrame(
+                frame, width=16, height=16, fg_color=color, corner_radius=8
+            ).pack(side="left", padx=(0, 6))
+        if calendar_id:
+            name = str((info or {}).get("summary") or calendar_id)
+            ctk.CTkLabel(
+                frame,
+                text=f"  Google Calendar · {name}  ",
+                font=font(10, "bold"),
+                fg_color=color or COLORS.surface_alt,
+                text_color=text_color_for(color) if color else COLORS.text,
+                corner_radius=8,
+                height=22,
+            ).pack(side="left")
+        else:
+            ctk.CTkLabel(
+                frame,
+                text="Nessun calendario Google collegato",
+                font=font(10),
+                text_color=COLORS.text_faint,
+            ).pack(side="left")
+        return frame
 
     def _detail_countdown(self, subject: dict[str, Any]) -> None:
         countdown = exam_countdown(str(subject.get("exam_date") or ""))
@@ -1191,6 +1225,9 @@ class SubjectDialog(ctk.CTkToplevel):
             self.app.on_subject_renamed(previous, saved_name)
         else:
             self.app.subject_folder(saved_name)
+            if not previous:
+                # Nuova materia: calendario Google dedicato, se l'opzione e' attiva.
+                self.app.ensure_google_calendar_for_subject(saved_name)
         self.view._selected = saved_name
         self.view._remember_selection(self.view._selected)
         self._close()

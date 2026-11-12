@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,12 +15,71 @@ from typing import Any, Iterable
 from .config import DEFAULT_BLOCKED_APPS, DEFAULT_BLOCKED_SITES, DEFAULT_SETTINGS
 from .services.spaced_repetition import DEFAULT_EASE_FACTOR, schedule_card
 from .services.subjects import MAX_CFU, cfu_to_hours, parse_exam_date
-from .utils import LOCAL_DATE_FMT, LOCAL_DATETIME_FMT, now_str, safe_float, safe_int
+from .utils import (
+    LOCAL_DATE_FMT,
+    LOCAL_DATETIME_FMT,
+    now_str,
+    parse_datetime,
+    safe_float,
+    safe_int,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+
+# Origine di un evento del calendario. Gli stati ``google_pending_*`` formano
+# la coda offline verso Google Calendar; ``google_pending_delete`` e' un
+# tombstone: resta nel database finche' Google non conferma l'eliminazione e
+# non compare mai nell'agenda.
+EVENT_SOURCE_MANUAL = "manual"
+EVENT_SOURCE_ICS = "ics_file"
+EVENT_SOURCE_GOOGLE = "google_api"
+EVENT_PENDING_CREATE = "google_pending_create"
+EVENT_PENDING_UPDATE = "google_pending_update"
+EVENT_PENDING_DELETE = "google_pending_delete"
+EVENT_SOURCES: tuple[str, ...] = (
+    EVENT_SOURCE_MANUAL,
+    EVENT_SOURCE_ICS,
+    EVENT_SOURCE_GOOGLE,
+    EVENT_PENDING_CREATE,
+    EVENT_PENDING_UPDATE,
+    EVENT_PENDING_DELETE,
+)
+EVENT_PENDING_SOURCES: tuple[str, ...] = (
+    EVENT_PENDING_CREATE,
+    EVENT_PENDING_UPDATE,
+    EVENT_PENDING_DELETE,
+)
+GOOGLE_LINKED_SOURCES: tuple[str, ...] = (
+    EVENT_SOURCE_GOOGLE,
+    EVENT_PENDING_UPDATE,
+    EVENT_PENDING_DELETE,
+)
+
+_HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def normalize_hex(value: Any) -> str | None:
+    """``#RRGGBB`` maiuscolo oppure ``None`` se il valore non e' un colore."""
+    match = _HEX_RE.match(str(value or "").strip())
+    return f"#{match.group(1).upper()}" if match else None
+
+
+def google_uid(google_calendar_id: str, google_event_id: str) -> str:
+    """UID locale di un evento Google.
+
+    Non usa ``iCalUID``: lo stesso evento potrebbe essere stato importato anche
+    da un file .ics e il vincolo ``UNIQUE(uid, start)`` andrebbe in conflitto.
+    """
+    return f"gcal:{google_event_id}@{google_calendar_id}"[:400]
+
+
+def _parse_local(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0, tzinfo=None)
+    return parse_datetime(str(value or ""))
 
 # Tabelle incluse nel backup JSON. L'ordine e' quello di inserimento: rispetta
 # le foreign key fra calendario, materiali, note, sessioni, flashcard e dubbi.
@@ -77,7 +138,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     subject TEXT NOT NULL DEFAULT '',
     duration_minutes INTEGER NOT NULL DEFAULT 0,
     completed INTEGER NOT NULL DEFAULT 0,
-    timestamp TEXT NOT NULL
+    timestamp TEXT NOT NULL,
+    calendar_event_id INTEGER REFERENCES calendar_events(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS distraction_attempts (
@@ -190,7 +252,9 @@ CREATE TABLE IF NOT EXISTS subjects (
     exam_date TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    google_calendar_id TEXT,
+    color_hex TEXT
 );
 
 CREATE TABLE IF NOT EXISTS calendar_events (
@@ -205,6 +269,14 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     all_day INTEGER NOT NULL DEFAULT 0,
     source_file TEXT NOT NULL DEFAULT '',
     imported_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'ics_file',
+    google_event_id TEXT,
+    google_calendar_id TEXT,
+    previous_google_calendar_id TEXT,
+    color_hex TEXT,
+    color_id TEXT,
+    sync_error TEXT NOT NULL DEFAULT '',
+    local_revision INTEGER NOT NULL DEFAULT 0,
     UNIQUE(uid, start)
 );
 
@@ -315,6 +387,64 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE calendar_events ADD COLUMN {column} {definition}"
                     )
+        self._migrate_v7_google(connection)
+
+    @staticmethod
+    def _migrate_v7_google(connection: sqlite3.Connection) -> None:
+        """Schema v7: sincronizzazione Google Calendar multi-calendario.
+
+        Idempotente: aggiunge solo le colonne mancanti. Gli eventi gia' presenti
+        provengono dall'importazione .ics, quindi ricevono ``source='ics_file'``.
+        """
+
+        def columns_of(table: str) -> set[str]:
+            return {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+
+        subject_columns = columns_of("subjects")
+        for column in ("google_calendar_id", "color_hex"):
+            if subject_columns and column not in subject_columns:
+                connection.execute(f"ALTER TABLE subjects ADD COLUMN {column} TEXT")
+
+        event_columns = columns_of("calendar_events")
+        if event_columns:
+            for column, definition in (
+                ("source", "TEXT NOT NULL DEFAULT 'ics_file'"),
+                ("google_event_id", "TEXT"),
+                ("google_calendar_id", "TEXT"),
+                ("previous_google_calendar_id", "TEXT"),
+                ("color_hex", "TEXT"),
+                ("color_id", "TEXT"),
+                ("sync_error", "TEXT NOT NULL DEFAULT ''"),
+                ("local_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in event_columns:
+                    connection.execute(
+                        f"ALTER TABLE calendar_events ADD COLUMN {column} {definition}"
+                    )
+
+        session_columns = columns_of("sessions")
+        if session_columns and "calendar_event_id" not in session_columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN calendar_event_id INTEGER "
+                "REFERENCES calendar_events(id) ON DELETE SET NULL"
+            )
+
+        connection.executescript(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_subjects_google_calendar
+                ON subjects(google_calendar_id)
+                WHERE google_calendar_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_google
+                ON calendar_events(google_calendar_id, google_event_id)
+                WHERE google_calendar_id IS NOT NULL AND google_event_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_events_source ON calendar_events(source);
+            CREATE INDEX IF NOT EXISTS idx_sessions_event ON sessions(calendar_event_id);
+            CREATE INDEX IF NOT EXISTS idx_materials_event ON materials(calendar_event_id);
+            """
+        )
 
     def _seed_defaults(self) -> None:
         with self._connection() as connection:
@@ -398,11 +528,24 @@ class Database:
             raise
 
     # -------------------------------------------------------------- sessions
-    def create_session(self, subject: str, timestamp: str | None = None) -> int:
+    def create_session(
+        self,
+        subject: str,
+        timestamp: str | None = None,
+        calendar_event_id: int | None = None,
+    ) -> int:
+        # La sottoquery evita violazioni di foreign key se l'evento e' stato
+        # rimosso (per esempio da una sincronizzazione) mentre il timer partiva.
         cursor = self._connection().execute(
-            "INSERT INTO sessions(subject, duration_minutes, completed, timestamp) "
-            "VALUES (?, 0, 0, ?)",
-            (subject.strip() or "Studio", timestamp or now_str()),
+            "INSERT INTO sessions(subject, duration_minutes, completed, timestamp, "
+            "calendar_event_id) VALUES (?, 0, 0, ?, "
+            "(SELECT id FROM calendar_events WHERE id = ? AND source <> ?))",
+            (
+                subject.strip() or "Studio",
+                timestamp or now_str(),
+                int(calendar_event_id) if calendar_event_id else None,
+                EVENT_PENDING_DELETE,
+            ),
         )
         return int(cursor.lastrowid)
 
@@ -1238,6 +1381,7 @@ class Database:
             "WITH names(name) AS ("
             "SELECT name FROM subjects WHERE TRIM(name) <> '' "
             "UNION SELECT subject FROM calendar_events WHERE TRIM(subject) <> '' "
+            f"AND source <> '{EVENT_PENDING_DELETE}' "
             "UNION SELECT subject FROM materials WHERE TRIM(subject) <> '' "
             "UNION SELECT subject FROM sessions WHERE TRIM(subject) <> '' "
             "UNION SELECT subject FROM video_lessons WHERE TRIM(subject) <> '' "
@@ -1252,6 +1396,8 @@ class Database:
             "COALESCE(s.notes, '') AS notes, "
             "COALESCE(s.created_at, '') AS created_at, "
             "COALESCE(s.updated_at, '') AS updated_at, "
+            "COALESCE(s.google_calendar_id, '') AS google_calendar_id, "
+            "COALESCE(s.color_hex, '') AS color_hex, "
             "(SELECT COUNT(*) FROM materials m "
             "WHERE LOWER(m.subject) = LOWER(n.name)) AS materials, "
             "(SELECT COUNT(*) FROM video_lessons v "
@@ -1265,7 +1411,8 @@ class Database:
             "(SELECT COUNT(*) FROM doubts d "
             "WHERE LOWER(d.subject) = LOWER(n.name)) AS doubts, "
             "(SELECT COUNT(*) FROM calendar_events e "
-            "WHERE LOWER(e.subject) = LOWER(n.name)) AS events, "
+            "WHERE LOWER(e.subject) = LOWER(n.name) "
+            f"AND e.source <> '{EVENT_PENDING_DELETE}') AS events, "
             "(SELECT COUNT(*) FROM sessions se "
             "WHERE LOWER(se.subject) = LOWER(n.name)) AS sessions, "
             "(SELECT COALESCE(SUM(se.duration_minutes), 0) FROM sessions se "
@@ -1532,10 +1679,12 @@ class Database:
         return len(rows)
 
     def get_events(self, start: str, end: str) -> list[dict[str, Any]]:
+        # I tombstone della coda offline (eliminazioni non ancora confermate da
+        # Google) non devono mai comparire nell'agenda.
         rows = self._connection().execute(
             "SELECT * FROM calendar_events WHERE end > ? AND start < ? "
-            "ORDER BY start, title",
-            (start, end),
+            "AND source <> ? ORDER BY start, title",
+            (start, end, EVENT_PENDING_DELETE),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1551,8 +1700,606 @@ class Database:
         return self.get_events(start, end)
 
     def clear_calendar_events(self) -> int:
-        cursor = self._connection().execute("DELETE FROM calendar_events")
+        """Svuota l'agenda locale.
+
+        I tombstone delle eliminazioni in coda restano, altrimenti un evento
+        cancellato offline non verrebbe mai rimosso da Google. Gli eventi
+        sincronizzati vengono riscaricati alla sincronizzazione successiva.
+        """
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            ids = [
+                int(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM calendar_events WHERE source <> ?",
+                    (EVENT_PENDING_DELETE,),
+                ).fetchall()
+            ]
+            self._unlink_event_refs(connection, ids)
+            cursor = connection.execute(
+                "DELETE FROM calendar_events WHERE source <> ?", (EVENT_PENDING_DELETE,)
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
         return int(cursor.rowcount)
+
+    # ------------------------------------------------------- google calendar
+    @staticmethod
+    def _unlink_event_refs(connection: sqlite3.Connection, event_ids: Iterable[int]) -> None:
+        """Scollega sessioni e materiali dagli eventi senza cancellare lo storico."""
+        ids = [int(value) for value in event_ids]
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            marks = ", ".join("?" for _ in chunk)
+            connection.execute(
+                f"UPDATE sessions SET calendar_event_id = NULL "
+                f"WHERE calendar_event_id IN ({marks})",
+                chunk,
+            )
+            connection.execute(
+                f"UPDATE materials SET calendar_event_id = NULL "
+                f"WHERE calendar_event_id IN ({marks})",
+                chunk,
+            )
+
+    def _delete_events(self, connection: sqlite3.Connection, event_ids: list[int]) -> int:
+        if not event_ids:
+            return 0
+        self._unlink_event_refs(connection, event_ids)
+        removed = 0
+        for offset in range(0, len(event_ids), 500):
+            chunk = event_ids[offset:offset + 500]
+            marks = ", ".join("?" for _ in chunk)
+            cursor = connection.execute(
+                f"DELETE FROM calendar_events WHERE id IN ({marks})", chunk
+            )
+            removed += int(cursor.rowcount)
+        return removed
+
+    def subject_calendar_map(self) -> dict[str, dict[str, str]]:
+        """``google_calendar_id -> {name, color_hex}`` per le materie collegate."""
+        rows = self._connection().execute(
+            "SELECT name, google_calendar_id, COALESCE(color_hex, '') AS color_hex "
+            "FROM subjects WHERE google_calendar_id IS NOT NULL"
+        ).fetchall()
+        return {
+            str(row["google_calendar_id"]): {
+                "name": str(row["name"]),
+                "color_hex": str(row["color_hex"] or ""),
+            }
+            for row in rows
+        }
+
+    def get_subject_calendar(self, subject: str) -> tuple[str | None, str | None]:
+        """Calendario Google e colore della materia (``(None, None)`` se assenti)."""
+        clean = str(subject or "").strip()
+        if not clean:
+            return None, None
+        row = self._connection().execute(
+            "SELECT google_calendar_id, color_hex FROM subjects "
+            "WHERE LOWER(TRIM(name)) = LOWER(?)",
+            (clean,),
+        ).fetchone()
+        if row is None:
+            return None, None
+        return (row["google_calendar_id"] or None), (row["color_hex"] or None)
+
+    def link_subject_calendar(
+        self,
+        subject: str,
+        google_calendar_id: str | None,
+        color_hex: str | None = None,
+    ) -> None:
+        """Collega (o scollega con ``None``) una materia a un calendario Google.
+
+        Un calendario appartiene al massimo a una materia: un collegamento
+        precedente dello stesso calendario viene rimosso. Se la materia esiste
+        solo come etichetta viene creata la sua riga in ``subjects``.
+        """
+        clean = str(subject or "").strip()[:150]
+        if not clean:
+            raise ValueError("Il nome della materia e' obbligatorio.")
+        calendar_id = str(google_calendar_id or "").strip() or None
+        color = normalize_hex(color_hex)
+        timestamp = now_str()
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if calendar_id is not None:
+                connection.execute(
+                    "UPDATE subjects SET google_calendar_id = NULL, updated_at = ? "
+                    "WHERE google_calendar_id = ? AND LOWER(name) <> LOWER(?)",
+                    (timestamp, calendar_id, clean),
+                )
+            existing = connection.execute(
+                "SELECT id FROM subjects WHERE LOWER(name) = LOWER(?)", (clean,)
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO subjects(name, created_at, updated_at, "
+                    "google_calendar_id, color_hex) VALUES (?, ?, ?, ?, ?)",
+                    (clean, timestamp, timestamp, calendar_id, color),
+                )
+            elif calendar_id is None:
+                connection.execute(
+                    "UPDATE subjects SET google_calendar_id = NULL, updated_at = ? "
+                    "WHERE id = ?",
+                    (timestamp, int(existing["id"])),
+                )
+            else:
+                connection.execute(
+                    "UPDATE subjects SET google_calendar_id = ?, "
+                    "color_hex = COALESCE(?, color_hex), updated_at = ? WHERE id = ?",
+                    (calendar_id, color, timestamp, int(existing["id"])),
+                )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+    def unlink_calendar(self, google_calendar_id: str) -> None:
+        self._connection().execute(
+            "UPDATE subjects SET google_calendar_id = NULL, updated_at = ? "
+            "WHERE google_calendar_id = ?",
+            (now_str(), str(google_calendar_id)),
+        )
+
+    def set_calendar_color(self, google_calendar_id: str, color_hex: str | None) -> None:
+        """Aggiorna il colore della materia collegata al calendario indicato."""
+        color = normalize_hex(color_hex)
+        if color is None:
+            return
+        self._connection().execute(
+            "UPDATE subjects SET color_hex = ? WHERE google_calendar_id = ? "
+            "AND COALESCE(color_hex, '') <> ?",
+            (color, str(google_calendar_id), color),
+        )
+
+    def save_local_event(
+        self,
+        event_id: int | None,
+        title: str,
+        subject: str,
+        start: str,
+        end: str,
+        all_day: bool = False,
+        description: str = "",
+        color_hex: str | None = None,
+        color_id: str | None = None,
+        location: str | None = None,
+        google_connected: bool = True,
+    ) -> int:
+        """Crea o modifica un evento da StudyFlow e lo accoda verso Google.
+
+        Transizioni di ``source``:
+
+        - nuovo evento con materia collegata a un calendario (account connesso)
+          -> ``google_pending_create``; altrimenti ``manual`` (solo locale);
+        - ``google_api`` modificato -> ``google_pending_update``; se la materia
+          porta l'evento su un altro calendario viene ricordato quello di
+          origine in ``previous_google_calendar_id`` per la ``move``;
+        - ``google_pending_create`` resta tale (non esiste ancora su Google);
+        - ``manual`` assegnato a una materia collegata -> ``google_pending_create``;
+        - ``ics_file`` resta locale: l'importazione .ics non cambia.
+        """
+        clean_title = str(title or "").strip()[:500]
+        if not clean_title:
+            raise ValueError("Il titolo dell'evento e' obbligatorio.")
+        start_dt = _parse_local(start)
+        end_dt = _parse_local(end)
+        if start_dt is None or end_dt is None:
+            raise ValueError("Data o ora dell'evento non valide.")
+        if end_dt <= start_dt:
+            raise ValueError("La fine dell'evento deve essere successiva all'inizio.")
+        clean_subject = str(subject or "").strip()[:150]
+        clean_description = str(description or "").strip()
+        target_calendar, subject_color = self.get_subject_calendar(clean_subject)
+        clean_color_id = str(color_id or "").strip() or None
+        final_color = normalize_hex(color_hex) or subject_color
+        values = {
+            "title": clean_title,
+            "subject": clean_subject,
+            "start": start_dt.strftime(LOCAL_DATETIME_FMT),
+            "end": end_dt.strftime(LOCAL_DATETIME_FMT),
+            "all_day": 1 if all_day else 0,
+            "description": clean_description,
+            "color_hex": final_color,
+            "color_id": clean_color_id,
+        }
+        timestamp = now_str()
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if event_id is None:
+                push = bool(target_calendar) and google_connected
+                cursor = connection.execute(
+                    "INSERT INTO calendar_events(uid, title, subject, start, end, "
+                    "location, description, all_day, source_file, imported_at, source, "
+                    "google_calendar_id, color_hex, color_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)",
+                    (
+                        f"studyflow-local-{uuid.uuid4().hex}",
+                        values["title"],
+                        values["subject"],
+                        values["start"],
+                        values["end"],
+                        str(location or "").strip()[:500],
+                        values["description"],
+                        values["all_day"],
+                        timestamp,
+                        EVENT_PENDING_CREATE if push else EVENT_SOURCE_MANUAL,
+                        target_calendar if push else None,
+                        values["color_hex"],
+                        values["color_id"],
+                    ),
+                )
+                new_id = int(cursor.lastrowid)
+                connection.execute("COMMIT")
+                return new_id
+
+            row = connection.execute(
+                "SELECT * FROM calendar_events WHERE id = ?", (int(event_id),)
+            ).fetchone()
+            if row is None or row["source"] == EVENT_PENDING_DELETE:
+                raise ValueError("Evento non trovato.")
+            source = str(row["source"])
+            current_calendar = row["google_calendar_id"]
+            previous_calendar = row["previous_google_calendar_id"]
+            new_source = source
+            new_calendar = current_calendar
+            if source in (EVENT_SOURCE_GOOGLE, EVENT_PENDING_UPDATE):
+                new_source = EVENT_PENDING_UPDATE
+                if target_calendar and target_calendar != current_calendar:
+                    if previous_calendar is None:
+                        previous_calendar = current_calendar
+                    new_calendar = target_calendar
+                if previous_calendar == new_calendar:
+                    previous_calendar = None
+            elif source == EVENT_PENDING_CREATE:
+                if target_calendar:
+                    new_calendar = target_calendar
+            elif source == EVENT_SOURCE_MANUAL:
+                if target_calendar and google_connected:
+                    new_source = EVENT_PENDING_CREATE
+                    new_calendar = target_calendar
+            # ics_file: modifica solo locale.
+            connection.execute(
+                "UPDATE calendar_events SET title = ?, subject = ?, start = ?, end = ?, "
+                "all_day = ?, description = ?, color_hex = ?, color_id = ?, "
+                "location = COALESCE(?, location), source = ?, google_calendar_id = ?, "
+                "previous_google_calendar_id = ?, sync_error = '', imported_at = ?, "
+                "local_revision = local_revision + 1 WHERE id = ?",
+                (
+                    values["title"],
+                    values["subject"],
+                    values["start"],
+                    values["end"],
+                    values["all_day"],
+                    values["description"],
+                    values["color_hex"],
+                    values["color_id"],
+                    None if location is None else str(location).strip()[:500],
+                    new_source,
+                    new_calendar,
+                    previous_calendar,
+                    timestamp,
+                    int(event_id),
+                ),
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        return int(event_id)
+
+    def delete_local_event(self, event_id: int) -> str:
+        """Elimina un evento da StudyFlow.
+
+        Gli eventi presenti su Google diventano tombstone ``google_pending_delete``
+        (spariscono subito dall'agenda); gli altri vengono rimossi. In entrambi
+        i casi sessioni e materiali vengono solo scollegati.
+        Restituisce ``"queued"`` oppure ``"deleted"``.
+        """
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM calendar_events WHERE id = ?", (int(event_id),)
+            ).fetchone()
+            if row is None or row["source"] == EVENT_PENDING_DELETE:
+                connection.execute("COMMIT")
+                return "deleted"
+            source = str(row["source"])
+            if source in (EVENT_SOURCE_GOOGLE, EVENT_PENDING_UPDATE) and row["google_event_id"]:
+                # Se uno spostamento non e' ancora stato inviato, l'evento si
+                # trova ancora nel calendario di origine.
+                real_calendar = row["previous_google_calendar_id"] or row["google_calendar_id"]
+                conflict = connection.execute(
+                    "SELECT id FROM calendar_events WHERE google_calendar_id = ? "
+                    "AND google_event_id = ? AND id <> ?",
+                    (real_calendar, row["google_event_id"], int(event_id)),
+                ).fetchone()
+                if conflict is not None:
+                    self._delete_events(connection, [int(conflict["id"])])
+                self._unlink_event_refs(connection, [int(event_id)])
+                connection.execute(
+                    "UPDATE calendar_events SET source = ?, google_calendar_id = ?, "
+                    "previous_google_calendar_id = NULL, sync_error = '', imported_at = ?, "
+                    "local_revision = local_revision + 1 WHERE id = ?",
+                    (EVENT_PENDING_DELETE, real_calendar, now_str(), int(event_id)),
+                )
+                result = "queued"
+            else:
+                self._delete_events(connection, [int(event_id)])
+                result = "deleted"
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        return result
+
+    def list_pending_events(self) -> list[dict[str, Any]]:
+        rows = self._connection().execute(
+            "SELECT * FROM calendar_events WHERE source IN (?, ?, ?) ORDER BY id",
+            EVENT_PENDING_SOURCES,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_pending_events(self) -> int:
+        row = self._connection().execute(
+            "SELECT COUNT(*) AS total FROM calendar_events WHERE source IN (?, ?, ?)",
+            EVENT_PENDING_SOURCES,
+        ).fetchone()
+        return safe_int(row["total"] if row else 0)
+
+    def mark_event_synced(
+        self,
+        event_id: int,
+        google_event_id: str,
+        google_calendar_id: str,
+        revision: int,
+    ) -> str:
+        """Conferma che Google ha applicato la modifica letta alla ``revision`` data.
+
+        Restituisce:
+
+        - ``"synced"``: nessuna modifica locale nel frattempo, ``source='google_api'``;
+        - ``"changed"``: l'utente ha modificato l'evento mentre la richiesta era in
+          volo; resta in coda come ``google_pending_update`` (con l'id Google);
+        - ``"missing"``: l'evento e' stato eliminato localmente nel frattempo
+          (il chiamante deve rimuoverlo anche da Google).
+        """
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT source, local_revision, google_calendar_id FROM calendar_events "
+                "WHERE id = ?",
+                (int(event_id),),
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return "missing"
+            if row["source"] == EVENT_PENDING_DELETE:
+                # Eliminato mentre veniva creato/aggiornato: il tombstone deve
+                # puntare all'evento reale.
+                connection.execute(
+                    "UPDATE calendar_events SET google_event_id = ?, google_calendar_id = ? "
+                    "WHERE id = ?",
+                    (str(google_event_id), str(google_calendar_id), int(event_id)),
+                )
+                connection.execute("COMMIT")
+                return "changed"
+            if safe_int(row["local_revision"]) == int(revision):
+                connection.execute(
+                    "UPDATE calendar_events SET source = ?, google_event_id = ?, "
+                    "google_calendar_id = ?, previous_google_calendar_id = NULL, "
+                    "sync_error = '', uid = CASE WHEN uid LIKE 'studyflow-local-%' "
+                    "THEN ? ELSE uid END WHERE id = ?",
+                    (
+                        EVENT_SOURCE_GOOGLE,
+                        str(google_event_id),
+                        str(google_calendar_id),
+                        google_uid(google_calendar_id, google_event_id),
+                        int(event_id),
+                    ),
+                )
+                result = "synced"
+            else:
+                current_calendar = row["google_calendar_id"]
+                connection.execute(
+                    "UPDATE calendar_events SET source = ?, google_event_id = ?, "
+                    "previous_google_calendar_id = ?, google_calendar_id = ? WHERE id = ?",
+                    (
+                        EVENT_PENDING_UPDATE,
+                        str(google_event_id),
+                        None
+                        if not current_calendar or current_calendar == google_calendar_id
+                        else str(google_calendar_id),
+                        current_calendar or str(google_calendar_id),
+                        int(event_id),
+                    ),
+                )
+                result = "changed"
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        return result
+
+    def mark_event_moved(self, event_id: int, moved_to: str) -> None:
+        """La ``move`` e' riuscita: ora l'evento si trova in ``moved_to``."""
+        target = str(moved_to)
+        self._connection().execute(
+            "UPDATE calendar_events SET "
+            "google_calendar_id = CASE WHEN source = ? THEN ? ELSE google_calendar_id END, "
+            "previous_google_calendar_id = CASE "
+            "WHEN source = ? THEN NULL "
+            "WHEN google_calendar_id = ? THEN NULL ELSE ? END "
+            "WHERE id = ?",
+            (EVENT_PENDING_DELETE, target, EVENT_PENDING_DELETE, target, target, int(event_id)),
+        )
+
+    def requeue_as_create(self, event_id: int) -> None:
+        """L'evento modificato non esiste piu' su Google: verra' ricreato."""
+        self._connection().execute(
+            "UPDATE calendar_events SET source = ?, google_event_id = NULL, "
+            "previous_google_calendar_id = NULL WHERE id = ? AND source = ?",
+            (EVENT_PENDING_CREATE, int(event_id), EVENT_PENDING_UPDATE),
+        )
+
+    def set_event_sync_error(self, event_id: int, message: str) -> None:
+        self._connection().execute(
+            "UPDATE calendar_events SET sync_error = ? WHERE id = ?",
+            (str(message or "")[:500], int(event_id)),
+        )
+
+    def purge_tombstone(self, event_id: int) -> None:
+        self._connection().execute(
+            "DELETE FROM calendar_events WHERE id = ? AND source = ?",
+            (int(event_id), EVENT_PENDING_DELETE),
+        )
+
+    def upsert_google_events(
+        self,
+        google_calendar_id: str,
+        events: Iterable[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Inserisce o aggiorna gli eventi scaricati da un calendario Google.
+
+        Non tocca mai i record locali in ``google_pending_update`` o
+        ``google_pending_delete`` (anche se lo spostamento verso un altro
+        calendario non e' ancora stato inviato): le modifiche locali in coda
+        hanno la precedenza sul pull.
+        """
+        calendar_id = str(google_calendar_id)
+        imported_at = now_str()
+        inserted = updated = skipped = 0
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for event in events:
+                google_event_id = str(event.get("google_event_id") or "").strip()
+                start = str(event.get("start") or "").strip()
+                end = str(event.get("end") or "").strip()
+                if not google_event_id or not start or not end:
+                    continue
+                pending = connection.execute(
+                    "SELECT id FROM calendar_events WHERE google_event_id = ? "
+                    "AND source IN (?, ?) AND (google_calendar_id = ? "
+                    "OR previous_google_calendar_id = ?)",
+                    (
+                        google_event_id,
+                        EVENT_PENDING_UPDATE,
+                        EVENT_PENDING_DELETE,
+                        calendar_id,
+                        calendar_id,
+                    ),
+                ).fetchone()
+                if pending is not None:
+                    skipped += 1
+                    continue
+                values = (
+                    str(event.get("title") or "Evento senza titolo").strip()[:500],
+                    str(event.get("subject") or "").strip()[:150],
+                    start,
+                    end,
+                    str(event.get("location") or "").strip()[:500],
+                    str(event.get("description") or "").strip(),
+                    1 if event.get("all_day") else 0,
+                    normalize_hex(event.get("color_hex")),
+                    str(event.get("color_id") or "").strip() or None,
+                    imported_at,
+                )
+                existing = connection.execute(
+                    "SELECT id FROM calendar_events WHERE google_calendar_id = ? "
+                    "AND google_event_id = ?",
+                    (calendar_id, google_event_id),
+                ).fetchone()
+                if existing is not None:
+                    connection.execute(
+                        "UPDATE calendar_events SET title = ?, subject = ?, start = ?, "
+                        "end = ?, location = ?, description = ?, all_day = ?, "
+                        "color_hex = ?, color_id = ?, imported_at = ?, source = ?, "
+                        "sync_error = '' WHERE id = ?",
+                        (*values, EVENT_SOURCE_GOOGLE, int(existing["id"])),
+                    )
+                    updated += 1
+                else:
+                    connection.execute(
+                        "INSERT INTO calendar_events(title, subject, start, end, location, "
+                        "description, all_day, color_hex, color_id, imported_at, uid, "
+                        "source_file, source, google_event_id, google_calendar_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Google Calendar', ?, ?, ?)",
+                        (
+                            *values,
+                            google_uid(calendar_id, google_event_id),
+                            EVENT_SOURCE_GOOGLE,
+                            google_event_id,
+                            calendar_id,
+                        ),
+                    )
+                    inserted += 1
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        return {"inserted": inserted, "updated": updated, "skipped": skipped}
+
+    def mirror_google_deletions(
+        self,
+        google_calendar_id: str,
+        window_start: str,
+        window_end: str,
+        remote_event_ids: Iterable[str],
+    ) -> int:
+        """Rimuove gli eventi ``google_api`` spariti da Google nella finestra attiva.
+
+        Prima di eliminarli azzera ``calendar_event_id`` su sessioni e
+        materiali, cosi' lo storico di studio resta intatto.
+        """
+        keep = {str(value) for value in remote_event_ids}
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                "SELECT id, google_event_id FROM calendar_events "
+                "WHERE source = ? AND google_calendar_id = ? AND end > ? AND start < ?",
+                (EVENT_SOURCE_GOOGLE, str(google_calendar_id), window_start, window_end),
+            ).fetchall()
+            stale = [
+                int(row["id"])
+                for row in rows
+                if str(row["google_event_id"] or "") not in keep
+            ]
+            removed = self._delete_events(connection, stale)
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        return removed
+
+    def purge_unsynced_calendars(self, enabled_calendar_ids: Iterable[str]) -> int:
+        """Rimuove gli eventi ``google_api`` dei calendari non piu' sincronizzati."""
+        enabled = [str(value) for value in enabled_calendar_ids]
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            sql = "SELECT id FROM calendar_events WHERE source = ?"
+            params: list[Any] = [EVENT_SOURCE_GOOGLE]
+            if enabled:
+                sql += f" AND google_calendar_id NOT IN ({', '.join('?' for _ in enabled)})"
+                params.extend(enabled)
+            ids = [int(row["id"]) for row in connection.execute(sql, params).fetchall()]
+            removed = self._delete_events(connection, ids)
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        return removed
 
     # ---------------------------------------------------------------- blockers
     def list_blocked_sites(self, enabled_only: bool = False) -> list[dict[str, Any]]:

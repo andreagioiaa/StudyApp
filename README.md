@@ -45,6 +45,10 @@ per l'elaborazione o la sincronizzazione dei dati.
 - Avvio di un Pomodoro direttamente da un evento, con durata proposta in base
   all'evento.
 - Svuotamento del calendario importato.
+- Sincronizzazione bidirezionale con Google Calendar (OAuth 2.0 PKCE): un
+  calendario Google per materia, colori Google, sync automatica all'avvio e
+  pulsante **Sincronizza Ora** con indicatore del tempo trascorso, creazione /
+  modifica / eliminazione degli eventi da StudyFlow con coda offline.
 
 ### Materiali dentro le materie
 - I PDF, i documenti e le note non hanno piu' una sezione autonoma: ogni
@@ -446,6 +450,55 @@ L'importatore:
 
 Gli eventi possono essere aperti nella vista giornaliera o settimanale e avviati
 come sessione Pomodoro con **Studia ora**.
+
+### Google Calendar (sincronizzazione bidirezionale)
+
+**Configurazione (una sola volta)**
+
+1. In [Google Cloud Console](https://console.cloud.google.com/) crea un progetto,
+   abilita la **Google Calendar API** e configura la schermata di consenso OAuth
+   (tipo "Esterno", aggiungendo il tuo account tra gli utenti di test).
+2. In **Credenziali > Crea credenziali > ID client OAuth** scegli il tipo
+   **App desktop** e scarica il file JSON.
+3. In StudyFlow apri **Impostazioni > Google Calendar**, premi **Carica
+   credentials.json**, poi **Connetti account** e accetta nel browser.
+
+Il consenso usa OAuth 2.0 per app desktop: PKCE (S256) e un server di ritorno su
+`127.0.0.1` con porta effimera. `access_token`, `refresh_token` e
+`client_secret` sono cifrati con Windows DPAPI (legati all'utente Windows), non
+compaiono mai in `studyflow.log` e sono esclusi dal backup ZIP; un ripristino
+conserva il collegamento Google gia' presente sul PC.
+
+**Calendari, materie e colori**
+
+- I calendari con lo stesso nome di una materia (maiuscole ignorate) vengono
+  abbinati e abilitati automaticamente; gli altri si abbinano dalle
+  Impostazioni. Un calendario senza materia usa il titolo dell'evento come
+  materia (stesso comportamento dell'import `.ics`).
+- Il colore del calendario diventa il colore della materia (`subjects.color_hex`);
+  un `colorId` sul singolo evento ha la precedenza. L'agenda usa questi colori
+  con contrasto del testo automatico; la pagina della materia mostra il badge
+  del calendario collegato.
+- Opzione facoltativa: **Crea un calendario Google per ogni nuova materia**.
+- Finestra di sincronizzazione configurabile (predefinita: 180 giorni passati,
+  365 futuri).
+
+**Come funziona la sincronizzazione**
+
+1. *Flush della coda* (StudyFlow -> Google): `google_pending_create` (POST),
+   `google_pending_update` (`move` se la materia ha cambiato calendario, poi
+   PATCH), `google_pending_delete` (DELETE; il record "tombstone" sparisce su
+   204/410). La coda viene inviata subito dopo ogni modifica, in background; se
+   sei offline resta in attesa della sincronizzazione successiva.
+2. *Pull* (Google -> StudyFlow) per ogni calendario abilitato, con upsert su
+   `(google_calendar_id, google_event_id)`. Le modifiche locali ancora in coda
+   non vengono mai sovrascritte.
+3. *Cancellazione speculare*: un evento eliminato su Google sparisce anche da
+   StudyFlow; sessioni e materiali collegati restano (viene solo azzerato
+   `calendar_event_id`).
+
+Gli eventi importati da `.ics` restano locali; un nuovo evento con una materia
+senza calendario Google resta solo in StudyFlow (`source = 'manual'`).
 
 ---
 

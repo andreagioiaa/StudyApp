@@ -7,6 +7,7 @@ import os
 import queue
 import signal
 import sys
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -21,6 +22,7 @@ from ..logging_setup import setup_logging
 from ..paths import ensure_data_layout
 from ..services.audio_service import AudioController, audio_backend_info
 from ..services.blocker import BlockerController
+from ..services.calendar_sync import CalendarSyncService
 from ..services.pomodoro_service import PomodoroService
 from ..services.subject_folders import SubjectFolders
 from ..services.transcription import TranscriptionController, transcription_backend_info
@@ -65,6 +67,12 @@ class StudyFlowApp(ctk.CTk):
         except Exception:
             self.logger.exception("Creazione delle cartelle materia non riuscita.")
         self.pomodoro = PomodoroService(self.db, self.blocker)
+        # Google Calendar: tutte le chiamate HTTP avvengono in thread daemon; gli
+        # aggiornamenti tornano al main thread tramite la coda ``post``.
+        self.google_sync = CalendarSyncService(self.db)
+        self.google_sync.add_listener(
+            lambda kind, data: self.post(lambda: self._on_google_sync_event(kind, data))
+        )
         self._audio_autoplay = False
         self._audio_track = ""
         self._audio_volume = 0.55
@@ -108,6 +116,8 @@ class StudyFlowApp(ctk.CTk):
         # dopo l'avvio, cosi' anche "Analisi" e' pronta al primo clic.
         self.after(1500, self._warm_up_views)
         self.after(1000, self._global_poll)
+        # Sync automatica non bloccante all'avvio (se l'account e' collegato).
+        self.after(2500, self._startup_google_sync)
 
     # ------------------------------------------------------------------ chrome
     def _set_initial_geometry(self) -> None:
@@ -449,6 +459,55 @@ class StudyFlowApp(ctk.CTk):
             self.toast(f"Pomodoro completato · {minutes} minuti salvati.")
         else:
             self.toast(f"Sessione interrotta · {minutes} minuti salvati.")
+
+    # ------------------------------------------------------------ google calendar
+    def _startup_google_sync(self) -> None:
+        if self._closing:
+            return
+        try:
+            if self.google_sync.is_connected():
+                self.google_sync.sync_async("startup")
+        except Exception:
+            self.logger.exception("Avvio della sincronizzazione Google non riuscito.")
+
+    def _on_google_sync_event(self, kind: str, data: dict[str, Any]) -> None:
+        for key in ("calendar", "settings"):
+            view = self.views.get(key)
+            if view is not None and hasattr(view, "on_sync_event"):
+                try:
+                    view.on_sync_event(kind, data)
+                except Exception:
+                    self.logger.exception("Aggiornamento vista '%s' dopo la sync non riuscito.", key)
+        if kind == "sync_finished":
+            subjects = self.views.get("subjects")
+            if subjects is not None:
+                render_state(subjects).forget()
+                subjects.refresh_if_visible()
+            error = str(data.get("error") or "")
+            if error and data.get("reason") != "startup" and self._current_view != "calendar":
+                self.toast(f"Google Calendar: {error}")
+
+    def ensure_google_calendar_for_subject(self, subject: str) -> None:
+        """Crea in background il calendario Google di una nuova materia (se attivo)."""
+        name = str(subject or "").strip()
+        if not name or self.db.get_setting("google_auto_create_calendar") not in {"1", "true"}:
+            return
+        if not self.google_sync.is_connected():
+            return
+
+        def worker() -> None:
+            try:
+                created = self.google_sync.ensure_calendar_for_subject(name)
+            except Exception as exc:
+                self.logger.warning("Creazione calendario Google per '%s' non riuscita: %s", name, exc)
+                self.post(lambda: self.toast("Calendario Google della materia non creato."))
+            else:
+                if created:
+                    self.post(lambda: self._on_google_sync_event("sync_finished", {"reason": "subject"}))
+            finally:
+                self.db.close_current_thread()
+
+        threading.Thread(target=worker, name="StudyFlow-GoogleCalendarCreate", daemon=True).start()
 
     # ------------------------------------------------------------ cartelle materia
     def subject_folder(self, subject: str, kind: str | None = None) -> Path | None:

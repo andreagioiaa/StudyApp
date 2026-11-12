@@ -53,8 +53,10 @@ class PomodoroService:
         del seconds
         if phase != "work":
             return
+        with self._lock:
+            event_id = self._event_id
         try:
-            session_id = self.db.create_session(subject)
+            session_id = self.db.create_session(subject, calendar_event_id=event_id)
         except Exception as exc:
             LOGGER.exception("Creazione sessione non riuscita.")
             with self._lock:

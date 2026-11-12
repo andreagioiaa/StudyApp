@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..config import APP_VERSION
+from ..config import APP_VERSION, GOOGLE_ACCOUNT_SETTINGS
 from ..database import DATA_TABLES, SCHEMA_VERSION, Database
 from ..utils import now_str
 
@@ -44,6 +44,18 @@ def _target_path(target: str | Path) -> Path:
     return path
 
 
+def _strip_account_settings(tables: dict[str, Any]) -> dict[str, Any]:
+    """Toglie token OAuth, ``client_secret`` e stato account Google dal backup."""
+    rows = tables.get("settings")
+    if isinstance(rows, list):
+        tables["settings"] = [
+            row
+            for row in rows
+            if not (isinstance(row, dict) and str(row.get("key", "")) in GOOGLE_ACCOUNT_SETTINGS)
+        ]
+    return tables
+
+
 def _table_counts(tables: dict[str, Any]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for name, rows in tables.items():
@@ -59,7 +71,7 @@ def export_backup(
 ) -> dict[str, Any]:
     """Scrive un backup ZIP atomico e restituisce il riepilogo."""
     destination = _target_path(target)
-    tables = db.snapshot_tables()
+    tables = _strip_account_settings(db.snapshot_tables())
     counts = _table_counts(tables)
     exported_at = now_str()
     payload = {
@@ -189,7 +201,14 @@ def import_backup(
     """Sostituisce i dati con un backup, creando prima un backup di sicurezza."""
     path = Path(source).expanduser()
     manifest, payload = inspect_backup(path)
-    tables = payload["tables"]
+    tables = _strip_account_settings(payload["tables"])
+    # Il collegamento Google di questo PC sopravvive al ripristino.
+    current_settings = db.get_settings()
+    preserved = {
+        key: current_settings[key]
+        for key in GOOGLE_ACCOUNT_SETTINGS
+        if current_settings.get(key)
+    }
     data_dir = Path(paths["data"])
     backups_dir = data_dir / "backups"
     backups_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +217,8 @@ def import_backup(
     safety = export_backup(db, paths, safety_path)
     try:
         db.restore_tables(tables)
+        if preserved:
+            db.set_settings(preserved)
         extracted = _extract_transcripts(path, Path(paths["transcripts"]))
         # Se un percorso assoluto del backup non esiste su questo PC, prova a
         # ritrovare il .txt nella cartella trascrizioni corrente.
