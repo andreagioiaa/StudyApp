@@ -12,6 +12,7 @@ from typing import Any, Callable
 import customtkinter as ctk
 
 from ..config import COLORS
+from ..services.subject_folders import KIND_TRANSCRIPTS, move_file_into
 from ..services.transcription import (
     DEFAULT_LANGUAGE,
     DEFAULT_MODEL,
@@ -865,7 +866,7 @@ class VideoView(ctk.CTkFrame):
                 parent=self.winfo_toplevel(),
             )
             return False
-        target = self.transcripts_dir / transcript_filename(
+        target = self.transcripts_dir_for(subject) / transcript_filename(
             transcript_name, video_path.stem or "Trascrizione"
         )
         current = Path(str(lesson.get("transcript_path") or ""))
@@ -980,6 +981,9 @@ class VideoView(ctk.CTkFrame):
                 self.app.toast("Trascrizione completata, ma il salvataggio dei metadati è fallito.")
             else:
                 self.app.toast("Trascrizione completata e salvata.")
+            subjects_view = self.app.views.get("subjects")
+            if subjects_view is not None and hasattr(subjects_view, "refresh_if_visible"):
+                subjects_view.refresh_if_visible()
             self.refresh()
             self._selected_id = lesson_id
             self._refresh_list(False)
@@ -1052,7 +1056,7 @@ class VideoView(ctk.CTkFrame):
             return
         try:
             new_path = rename_transcript_file(
-                current_path, value, self.transcripts_dir
+                current_path, value, Path(current_path).parent
             )
             self.db.update_video_transcript_path(
                 int(lesson["id"]), str(new_path), new_path.name
@@ -1135,13 +1139,47 @@ class VideoView(ctk.CTkFrame):
                 except (OSError, AttributeError):
                     messagebox.showinfo("Cartella", str(path.parent), parent=self.winfo_toplevel())
 
-    def _open_transcripts_folder(self) -> None:
+    def transcripts_dir_for(self, subject: str) -> Path:
+        """Cartella ``Trascrizioni`` della materia, oppure quella generale se manca la materia."""
+        folder = self.app.subject_folder(subject, KIND_TRANSCRIPTS) if str(subject or "").strip() else None
+        return folder or self.transcripts_dir
+
+    def relocate_transcript(self, lesson_id: int, subject: str) -> None:
+        """Sposta il .txt di una videolezione nella cartella della sua materia."""
+        lesson = self.db.get_video_lesson(lesson_id)
+        if lesson is None or self._job_lesson_id() == lesson_id:
+            return
+        current = Path(str(lesson.get("transcript_path") or ""))
+        if not str(lesson.get("transcript_path") or "").strip() or not current.is_file():
+            return
+        target_dir = self.transcripts_dir_for(subject)
         try:
-            self.transcripts_dir.mkdir(parents=True, exist_ok=True)
-            os.startfile(str(self.transcripts_dir))  # type: ignore[attr-defined]
+            moved = move_file_into(current, target_dir)
+        except OSError:
+            self.app.logger.exception("Spostamento della trascrizione non riuscito.")
+            self.app.toast("Impossibile spostare la trascrizione nella cartella della materia.")
+            return
+        if moved != current:
+            self.db.update_video_transcript_path(lesson_id, str(moved), moved.name)
+
+    def focus_item(self, lesson_id: int | None = None, subject: str | None = None) -> None:
+        """Usato dalla pagina Materie: filtra per materia e seleziona la videolezione."""
+        if subject is not None:
+            self._filter_subject = subject or ALL_SUBJECTS
+        if lesson_id is not None:
+            self._selected_id = int(lesson_id)
+        render_state(self).forget()
+        self.refresh()
+
+    def _open_transcripts_folder(self) -> None:
+        subject = "" if self._filter_subject == ALL_SUBJECTS else self._filter_subject
+        folder = self.transcripts_dir_for(subject)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(folder))  # type: ignore[attr-defined]
         except (OSError, AttributeError):
             messagebox.showinfo(
-                "Cartella trascrizioni", str(self.transcripts_dir), parent=self.winfo_toplevel()
+                "Cartella trascrizioni", str(folder), parent=self.winfo_toplevel()
             )
 
 
@@ -1381,6 +1419,8 @@ class VideoDialog(ctk.CTkToplevel):
             if self.lesson:
                 self.db.update_video_lesson_metadata(int(self.lesson["id"]), title, subject)
                 lesson_id = int(self.lesson["id"])
+                if str(self.lesson.get("subject") or "").strip() != subject:
+                    self.view.relocate_transcript(lesson_id, subject)
             else:
                 duplicate = any(
                     Path(str(item.get("video_path") or "")).resolve() == path.resolve()
@@ -1404,6 +1444,8 @@ class VideoDialog(ctk.CTkToplevel):
             self.app.logger.exception("Salvataggio videolezione non riuscito.")
             messagebox.showerror("Salvataggio non riuscito", str(exc), parent=self)
             return
+        if subject:
+            self.app.subject_folder(subject)
         self.grab_release()
         self.destroy()
         self.view._selected_id = lesson_id

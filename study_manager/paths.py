@@ -69,6 +69,30 @@ def sounds_dir(data: Path) -> Path:
     return fallback
 
 
+def subjects_dir(data: Path) -> Path:
+    """Cartella ``Materie`` nella radice di funzionamento dell'app.
+
+    Come per ``sounds``: in modalita' sorgente e' la radice del progetto,
+    nell'exe la cartella che contiene StudyFlow.exe. Se non e' scrivibile
+    (es. Program Files) si usa ``%LOCALAPPDATA%\\StudyFlow\\Materie``.
+    ``STUDYFLOW_SUBJECTS_DIR`` permette di scegliere un percorso diverso.
+    """
+    override = os.environ.get("STUDYFLOW_SUBJECTS_DIR", "").strip()
+    if override:
+        path = Path(override).expanduser().resolve()
+    elif os.environ.get("STUDYFLOW_DATA_DIR", "").strip():
+        path = data / "Materie"
+    elif is_frozen():
+        path = executable_path().parent / "Materie"
+    else:
+        path = project_root() / "Materie"
+    if _is_writable(path):
+        return path
+    fallback = data / "Materie"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
 def ensure_data_layout() -> dict[str, Path]:
     """Crea e restituisce tutti i percorsi usati dall'applicazione."""
     data = app_data_dir()
@@ -79,12 +103,14 @@ def ensure_data_layout() -> dict[str, Path]:
     transcripts.mkdir(parents=True, exist_ok=True)
     models = data / "models"
     models.mkdir(parents=True, exist_ok=True)
+    subjects = subjects_dir(data)
     paths = {
         "data": data,
         "logs": logs,
         "sounds": sounds,
         "transcripts": transcripts,
         "models": models,
+        "subjects": subjects,
         "db": data / "study_manager.db",
         "log": logs / "studyflow.log",
         "guard_log": logs / "hosts_guard.log",

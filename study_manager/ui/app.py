@@ -22,6 +22,7 @@ from ..paths import ensure_data_layout
 from ..services.audio_service import AudioController, audio_backend_info
 from ..services.blocker import BlockerController
 from ..services.pomodoro_service import PomodoroService
+from ..services.subject_folders import SubjectFolders
 from ..services.transcription import TranscriptionController, transcription_backend_info
 from ..services.youtube_audio import youtube_backend_info
 from ..utils import safe_float
@@ -58,6 +59,11 @@ class StudyFlowApp(ctk.CTk):
         self.blocker = BlockerController(self.db, self.paths)
         self.audio = AudioController(self.paths["sounds"])
         self.transcriptions = TranscriptionController(self.paths)
+        self.subject_folders = SubjectFolders(self.paths["subjects"])
+        try:
+            self.subject_folders.ensure_all(self.db.list_subject_tags())
+        except Exception:
+            self.logger.exception("Creazione delle cartelle materia non riuscita.")
         self.pomodoro = PomodoroService(self.db, self.blocker)
         self._audio_autoplay = False
         self._audio_track = ""
@@ -443,6 +449,82 @@ class StudyFlowApp(ctk.CTk):
             self.toast(f"Pomodoro completato · {minutes} minuti salvati.")
         else:
             self.toast(f"Sessione interrotta · {minutes} minuti salvati.")
+
+    # ------------------------------------------------------------ cartelle materia
+    def subject_folder(self, subject: str, kind: str | None = None) -> Path | None:
+        """Cartella (o sottocartella ``kind``) della materia, creata se manca."""
+        if not str(subject or "").strip():
+            return None
+        if kind is None:
+            return self.subject_folders.ensure(subject)
+        return self.subject_folders.subfolder(subject, kind)
+
+    def on_subject_renamed(self, old_name: str, new_name: str) -> None:
+        """Rinomina la cartella su disco e aggiorna i percorsi salvati nel database."""
+        try:
+            old_dir, new_dir = self.subject_folders.rename(old_name, new_name)
+            if old_dir is not None and new_dir is not None and old_dir != new_dir:
+                self.db.relocate_paths(old_dir, new_dir)
+        except Exception:
+            self.logger.exception("Rinomina della cartella materia non riuscita.")
+            self.toast("Materia rinominata, ma la cartella su disco non e' stata spostata.")
+        self.sync_flashcard_export(new_name)
+
+    def sync_flashcard_export(self, *subjects: str) -> None:
+        """Aggiorna ``Flashcard/Flashcard.csv`` nelle cartelle delle materie indicate."""
+        seen: set[str] = set()
+        for subject in subjects:
+            name = str(subject or "").strip()
+            if not name or name.casefold() in seen:
+                continue
+            seen.add(name.casefold())
+            try:
+                cards = self.db.list_flashcards(subject=name, limit=100000)
+                self.subject_folders.export_flashcards(name, cards)
+            except Exception:
+                self.logger.exception("Export flashcard per '%s' non riuscito.", name)
+
+    def register_generated_material(self, file_path: str | Path, subject: str, title: str = "") -> None:
+        """Collega a una materia un file prodotto dall'app (es. export PDF)."""
+        name = str(subject or "").strip()
+        if not name:
+            return
+        path = Path(file_path)
+        existing = self.db.find_material_by_path(str(path))
+        if existing is not None:
+            self.db.update_material(
+                int(existing["id"]),
+                str(existing.get("title") or title or path.stem),
+                str(path),
+                name,
+                safe_float(existing.get("target_hours", 0)),
+                existing.get("calendar_event_id"),
+            )
+        else:
+            self.db.add_material(title or path.stem, str(path), name, 0, None)
+        subjects = self.views.get("subjects")
+        if subjects is not None:
+            subjects.refresh_if_visible()
+
+    def open_subject_folder(self, subject: str, kind: str | None = None) -> None:
+        folder = self.subject_folder(subject, kind)
+        if folder is None:
+            messagebox.showerror("Cartella materia", "Cartella non disponibile.", parent=self)
+            return
+        try:
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        except (OSError, AttributeError):
+            messagebox.showinfo("Cartella materia", str(folder), parent=self)
+
+    def open_in_view(self, key: str, **options: Any) -> None:
+        """Apre una sezione e, se la vista lo supporta, seleziona un elemento."""
+        self.show_view(key)
+        view = self.views.get(key)
+        if view is not None and hasattr(view, "focus_item"):
+            try:
+                view.focus_item(**options)
+            except Exception:
+                self.logger.exception("Apertura elemento in '%s' non riuscita.", key)
 
     def toast(self, message: str) -> None:
         if self._closing:

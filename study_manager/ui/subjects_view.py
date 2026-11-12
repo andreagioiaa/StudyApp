@@ -19,7 +19,9 @@ from ..services.subjects import (
     parse_exam_date,
 )
 from ..utils import format_hours
+from ..services.subject_folders import KIND_NOTES
 from .materials import ORPHAN_SUBJECT, ORPHAN_SUBJECT_KEY, MaterialsSection
+from .subject_content import FlashcardsSection, VideosSection
 from .theme import font
 from .widgets import (
     Card,
@@ -336,7 +338,13 @@ class SubjectsView(ctk.CTkFrame):
         if selected == ORPHAN_SUBJECT_KEY:
             detail_data: Any = self.db.list_materials_without_subject()
         elif selected:
-            detail_data = (self.db.get_subject(selected), self.db.list_materials_for_subject(selected))
+            detail_data = (
+                self.db.get_subject(selected),
+                self.db.list_materials_for_subject(selected),
+                self.db.list_video_lessons(selected),
+                self.db.list_flashcards(subject=selected),
+                self.db.flashcard_stats(selected),
+            )
         else:
             detail_data = None
         if not render_state(self).should_render("detail", selected, detail_data, date.today().isoformat()):
@@ -357,6 +365,8 @@ class SubjectsView(ctk.CTkFrame):
         self._detail_header(subject)
         self._detail_countdown(subject)
         self._detail_materials(subject)
+        self._detail_videos(subject, detail_data[2])
+        self._detail_flashcards(subject, detail_data[3], detail_data[4])
         self._detail_stats(subject)
         self._detail_teacher(subject)
         self._detail_links(subject)
@@ -499,6 +509,34 @@ class SubjectsView(ctk.CTkFrame):
             corner_radius=8,
             command=lambda value=dict(subject): self._open_dialog(value),
         ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            actions,
+            text="Apri cartella",
+            height=32,
+            width=110,
+            font=font(10, "bold"),
+            fg_color=COLORS.surface_alt,
+            hover_color=COLORS.surface_hover,
+            border_width=1,
+            border_color=COLORS.border,
+            text_color=COLORS.text,
+            corner_radius=8,
+            command=lambda value=str(subject.get("name") or ""): self.app.open_subject_folder(value),
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            actions,
+            text="Appunti PDF",
+            height=32,
+            width=104,
+            font=font(10),
+            fg_color="transparent",
+            hover_color=COLORS.surface_alt,
+            border_width=1,
+            border_color=COLORS.border,
+            text_color=COLORS.text_muted,
+            corner_radius=8,
+            command=lambda value=str(subject.get("name") or ""): self.app.open_subject_folder(value, KIND_NOTES),
+        ).pack(side="left", padx=(0, 6))
         linked = sum(
             int(subject.get(key, 0) or 0)
             for key in ("materials", "videos", "flashcards", "events", "sessions")
@@ -583,7 +621,7 @@ class SubjectsView(ctk.CTkFrame):
         study_hours = study_minutes / 60.0
         percent = min(100, int(round(study_hours / hours * 100))) if hours else 0
         stats = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-        stats.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        stats.grid(row=5, column=0, sticky="ew", pady=(0, 12))
         for column in range(2):
             stats.grid_columnconfigure(column, weight=1, uniform="subject_stats")
 
@@ -631,9 +669,21 @@ class SubjectsView(ctk.CTkFrame):
         )
         section.grid(row=2, column=0, sticky="ew", pady=(0, 12))
 
+    def _detail_videos(self, subject: dict[str, Any], lessons: list[dict[str, Any]]) -> None:
+        VideosSection(self.detail_scroll, self.app, str(subject.get("name") or ""), lessons).grid(
+            row=3, column=0, sticky="ew", pady=(0, 12)
+        )
+
+    def _detail_flashcards(
+        self, subject: dict[str, Any], cards: list[dict[str, Any]], stats: dict[str, int]
+    ) -> None:
+        FlashcardsSection(self.detail_scroll, self.app, str(subject.get("name") or ""), cards, stats).grid(
+            row=4, column=0, sticky="ew", pady=(0, 12)
+        )
+
     def _detail_teacher(self, subject: dict[str, Any]) -> None:
         card = Card(self.detail_scroll)
-        card.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        card.grid(row=6, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             card,
@@ -680,7 +730,7 @@ class SubjectsView(ctk.CTkFrame):
 
     def _detail_links(self, subject: dict[str, Any]) -> None:
         card = Card(self.detail_scroll)
-        card.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        card.grid(row=7, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             card,
@@ -721,7 +771,7 @@ class SubjectsView(ctk.CTkFrame):
         if not notes:
             return
         card = Card(self.detail_scroll)
-        card.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+        card.grid(row=8, column=0, sticky="ew", pady=(0, 4))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             card,
@@ -763,6 +813,10 @@ class SubjectsView(ctk.CTkFrame):
                 parent=self.winfo_toplevel(),
             )
             return
+        try:
+            self.app.subject_folders.remove_if_empty(name)
+        except Exception:
+            self.app.logger.debug("Cartella materia non rimossa.", exc_info=True)
         self._selected = None
         self.refresh()
         self.app.toast("Materia eliminata.")
@@ -1131,7 +1185,13 @@ class SubjectDialog(ctk.CTkToplevel):
             self.app.logger.exception("Salvataggio materia non riuscito.")
             messagebox.showerror("Salvataggio non riuscito", str(exc), parent=self)
             return
-        self.view._selected = str(saved.get("name") or name)
+        saved_name = str(saved.get("name") or name)
+        previous = str(self.original_name or "").strip()
+        if previous and previous != saved_name:
+            self.app.on_subject_renamed(previous, saved_name)
+        else:
+            self.app.subject_folder(saved_name)
+        self.view._selected = saved_name
         self.view._remember_selection(self.view._selected)
         self._close()
         self.view.refresh()

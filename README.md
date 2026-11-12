@@ -512,6 +512,39 @@ record.
 Avviando un Pomodoro da un materiale, i minuti effettivi vengono aggiunti alle
 ore registrate sia che la sessione venga completata sia che venga interrotta.
 
+### Cartella di ogni materia
+
+Ogni materia ha una cartella su disco nella radice di funzionamento dell'app
+(accanto a `StudyFlow.exe`, oppure nella radice del progetto in modalita'
+sorgente; se non e' scrivibile si usa `%LOCALAPPDATA%\StudyFlow\Materie`.
+`STUDYFLOW_SUBJECTS_DIR` permette di scegliere un altro percorso):
+
+```text
+Materie/
+  <Nome materia>/
+    Trascrizioni/   .txt delle videolezioni della materia
+    Appunti/        export TXT/LaTeX/Word di PDF e Slide
+    Flashcard/      Flashcard.csv (Fronte;Retro;Note), aggiornato a ogni modifica
+```
+
+- La cartella viene creata quando la materia nasce (anche se scritta per la
+  prima volta in un video, una flashcard o un materiale) e all'avvio per tutte
+  le materie note.
+- Rinominando la materia la cartella viene rinominata e i percorsi salvati
+  (materiali, trascrizioni) vengono aggiornati; eliminando la materia la
+  cartella viene rimossa solo se vuota.
+- **Video e Trascrizione**: la trascrizione viene scritta nella cartella
+  `Trascrizioni` della materia scelta; cambiando materia a una videolezione il
+  .txt viene spostato.
+- **PDF e Slide**: nella card *Esportazione* si sceglie la **Materia**; gli
+  export vengono proposti in `Appunti` e registrati come materiali della
+  materia.
+- La pagina materia mostra, oltre ai **MATERIALI**, le sezioni
+  **VIDEOLEZIONI E TRASCRIZIONI** e **FLASHCARD**, con i pulsanti per aprire i
+  file, la cartella o la sezione corrispondente (es. *Ripassa*).
+
+I file originali scelti dall'utente (PDF, video, dispense) non vengono copiati.
+
 ---
 
 ## 10. Audio, YouTube e suoni di concentrazione

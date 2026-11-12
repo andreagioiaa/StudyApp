@@ -236,6 +236,16 @@ class FlashcardView(ctk.CTkFrame):
         if self.app.is_view_visible(self):
             self.refresh()
 
+    def focus_item(self, subject: str | None = None, study: bool = False) -> None:
+        """Usato dalla pagina Materie: filtra per materia ed eventualmente avvia il ripasso."""
+        if subject is not None:
+            self._filter_subject = subject or ALL_SUBJECTS
+            self.subject_filter.set(self._filter_subject)
+        render_state(self).forget()
+        self.refresh()
+        if study:
+            self._study_due()
+
     def refresh(self) -> None:
         subjects = self.db.list_subject_tags()
         values = [ALL_SUBJECTS, *subjects]
@@ -480,6 +490,7 @@ class FlashcardView(ctk.CTkFrame):
         ):
             return
         self.db.delete_flashcard(int(card["id"]))
+        self.app.sync_flashcard_export(str(card.get("subject") or ""))
         self.refresh()
         self.app.toast("Flashcard eliminata.")
 
@@ -690,6 +701,8 @@ class FlashcardDialog(ctk.CTkToplevel):
             self.app.logger.exception("Salvataggio flashcard non riuscito.")
             messagebox.showerror("Salvataggio non riuscito", str(exc), parent=self)
             return
+        previous_subject = str(self.card.get("subject") or "") if self.card else ""
+        self.app.sync_flashcard_export(subject, previous_subject)
         self._close()
         self.view.refresh()
         self.app.toast("Flashcard salvata.")

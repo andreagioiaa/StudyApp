@@ -19,6 +19,7 @@ dist/
 *.db-shm
 *.log
 sounds/
+Materie/
 ffmpeg.exe
 
 # Editor / sistema

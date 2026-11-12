@@ -702,6 +702,7 @@ class MaterialDialog(ctk.CTkToplevel):
                 )
             else:
                 self.db.add_material(title, file_path, subject, target, event_id)
+            self.app.subject_folder(subject)
         except Exception as exc:
             self.app.logger.exception("Salvataggio materiale non riuscito.")
             messagebox.showerror("Salvataggio non riuscito", str(exc), parent=self)

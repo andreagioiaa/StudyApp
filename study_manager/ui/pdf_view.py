@@ -23,6 +23,7 @@ from typing import Any, Callable
 import customtkinter as ctk
 
 from ..config import COLORS, FONT_FAMILY, MONO_FONT_FAMILY
+from ..services.subject_folders import KIND_NOTES
 from ..services.pdf_tools.controller import PdfConversionController, list_pdfs
 from ..services.pdf_tools.inline import (
     STYLE_BOLD,
@@ -134,7 +135,10 @@ SETTING_DEFAULTS = {
     "pdf_latex_level": "section",
     "pdf_latex_template": "",
     "pdf_panel_collapsed": "0",
+    "pdf_subject": "",
 }
+
+NO_SUBJECT = "Nessuna materia"
 
 PREVIEW_RENDER_CHUNK = 18
 HEADING_FONT_SIZES = {"h1": 19, "h2": 15, "h3": 13}
@@ -268,6 +272,7 @@ class PdfView(ctk.CTkFrame):
         self._template_error = ""
         self._load_template_text()
         self._panel_collapsed = self._bool(settings["pdf_panel_collapsed"])
+        self.subject_var = ctk.StringVar(value=settings["pdf_subject"] or NO_SUBJECT)
 
     def _save_settings(self, *_args) -> None:
         values = {
@@ -298,6 +303,7 @@ class PdfView(ctk.CTkFrame):
             "pdf_latex_level": self._latex_defaults["base_level"],
             "pdf_latex_template": self._template_path,
             "pdf_panel_collapsed": "1" if self._panel_collapsed else "0",
+            "pdf_subject": self.selected_subject(),
         }
         try:
             self.db.set_settings(values)
@@ -466,6 +472,19 @@ class PdfView(ctk.CTkFrame):
 
         # Esportazione
         export = self._card(panel, 1, "Esportazione", "Le opzioni valgono per anteprima, copia ed esportazione.")
+
+        self._small_label(export, "Materia").pack(anchor="w", padx=16)
+        self.subject_combo = ctk.CTkComboBox(
+            export, values=[NO_SUBJECT], variable=self.subject_var, command=self._on_subject_change,
+            border_color=COLORS.border, **self._menu_style(),
+        )
+        self.subject_combo.pack(fill="x", padx=16, pady=(4, 2))
+        self.subject_combo.bind("<FocusOut>", lambda _event: self._on_subject_change())
+        self.subject_hint = ctk.CTkLabel(
+            export, text="", font=font(10), text_color=COLORS.text_faint, anchor="w", justify="left", wraplength=270,
+        )
+        self.subject_hint.pack(fill="x", padx=16, pady=(0, 8))
+        self._refresh_subjects()
 
         for text, variable in (
             ("Marcatori e numeri di slide", self.markers_var),
@@ -1807,7 +1826,58 @@ class PdfView(ctk.CTkFrame):
         self.app.toast("Anteprima KaTeX aperta nel browser (offline).")
 
     # ------------------------------------------------------------------ esportazione
+    # ------------------------------------------------------------------ materia
+    def selected_subject(self) -> str:
+        value = self.subject_var.get().strip() if hasattr(self, "subject_var") else ""
+        return "" if value in {"", NO_SUBJECT} else value
+
+    def _refresh_subjects(self) -> None:
+        try:
+            tags = self.db.list_subject_tags()
+        except Exception:
+            tags = []
+        current = self.selected_subject()
+        values = [NO_SUBJECT, *tags]
+        if current and current.casefold() not in {tag.casefold() for tag in tags}:
+            values.append(current)
+        self.subject_combo.configure(values=values)
+        self.subject_combo.set(current or NO_SUBJECT)
+        self._update_subject_hint()
+
+    def _update_subject_hint(self) -> None:
+        subject = self.selected_subject()
+        if subject:
+            text = f"Gli export vanno in Materie/{subject}/Appunti e compaiono nella pagina della materia."
+        else:
+            text = "Scegli una materia per salvare gli export nella sua cartella e collegarli alla materia."
+        self.subject_hint.configure(text=text)
+
+    def _on_subject_change(self, *_args) -> None:
+        subject = self.selected_subject()
+        if subject:
+            self.app.subject_folder(subject)
+        self._update_subject_hint()
+        self._save_settings()
+
+    def _link_exports(self, paths: list[Path]) -> None:
+        """Collega i file esportati alla materia scelta (sezione Materie)."""
+        subject = self.selected_subject()
+        if not subject:
+            return
+        for path in paths:
+            if not path.is_file():
+                continue
+            try:
+                self.app.register_generated_material(path, subject, path.name)
+            except Exception:
+                LOGGER.exception("Collegamento dell'export alla materia non riuscito.")
+
     def _export_initial_dir(self, doc: DocState) -> str:
+        subject = self.selected_subject()
+        if subject:
+            folder = self.app.subject_folder(subject, KIND_NOTES)
+            if folder is not None:
+                return str(folder)
         if self._export_dir and Path(self._export_dir).is_dir():
             return self._export_dir
         return str(doc.path.parent)
@@ -1825,7 +1895,8 @@ class PdfView(ctk.CTkFrame):
         )
         if not target:
             return
-        self._export_dir = str(Path(target).parent)
+        if not self.selected_subject():
+            self._export_dir = str(Path(target).parent)
         self._save_settings()
         source, source_format, options = doc.source, doc.fmt, self.render_options(doc)
         if fmt != FORMAT_DOCX:
@@ -1834,6 +1905,7 @@ class PdfView(ctk.CTkFrame):
             except (ExportError, OSError) as exc:
                 messagebox.showerror("PDF e Slide", f"Esportazione non riuscita:\n{exc}", parent=self)
                 return
+            self._link_exports([Path(target)])
             self._set_status(f"Esportato: {Path(target).name}")
             self.app.toast(f"Esportato {Path(target).name}")
             return
@@ -1842,7 +1914,14 @@ class PdfView(ctk.CTkFrame):
             progress(0.3, "Conversione Word con Pandoc…")
             return export_file(source, source_format, fmt, target, options)
 
-        self._run_task(task, f"Esportato: {Path(target).name}")
+        def done(_event: dict[str, Any]) -> None:
+            self._link_exports([Path(target)])
+            message = f"Esportato: {Path(target).name}"
+            self._set_status(message)
+            self.progress.set(1.0)
+            self.app.toast(message)
+
+        self._run_task(task, f"Esportato: {Path(target).name}", done)
 
     def export_all(self) -> None:
         self._commit_editor()
@@ -1854,7 +1933,8 @@ class PdfView(ctk.CTkFrame):
         )
         if not folder:
             return
-        self._export_dir = folder
+        if not self.selected_subject():
+            self._export_dir = folder
         self._save_settings()
         formats = BATCH_FORMAT_CHOICES.get(self.batch_format_var.get(), [FORMAT_DOCX])
         jobs = [(doc, fmt, Path(folder) / f"{doc.path.stem}.{fmt}") for doc in ready for fmt in formats]
@@ -1869,6 +1949,7 @@ class PdfView(ctk.CTkFrame):
 
         def task(progress, cancel):
             written = 0
+            written_paths: list[str] = []
             errors: list[str] = []
             for index, (source, source_format, options, fmt, target) in enumerate(snapshots):
                 if cancel.is_set():
@@ -1877,14 +1958,16 @@ class PdfView(ctk.CTkFrame):
                 try:
                     export_file(source, source_format, fmt, target, options)
                     written += 1
+                    written_paths.append(str(target))
                 except (ExportError, OSError) as exc:
                     errors.append(f"{target.name}: {exc}")
             if errors and not written:
                 raise ExportError("\n".join(errors[:5]))
-            return {"written": written, "errors": errors, "folder": folder}
+            return {"written": written, "errors": errors, "folder": folder, "paths": written_paths}
 
         def done(event: dict[str, Any]) -> None:
             result = event.get("result") or {}
+            self._link_exports([Path(value) for value in result.get("paths") or []])
             message = f"Esportati {result.get('written', 0)} file in {Path(folder).name}."
             if result.get("errors"):
                 message += f" {len(result['errors'])} errori."
@@ -2208,6 +2291,7 @@ class PdfView(ctk.CTkFrame):
 
     # ------------------------------------------------------------------ ciclo di vita
     def on_show(self) -> None:
+        self._refresh_subjects()
         self._update_buttons()
         if self.controller.is_running():
             self._start_polling()

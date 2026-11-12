@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -488,6 +489,48 @@ class Database:
                 int(material_id),
             ),
         )
+
+    def find_material_by_path(self, file_path: str) -> dict[str, Any] | None:
+        """Materiale gia' registrato per lo stesso file (confronto case-insensitive)."""
+        wanted = os.path.normcase(os.path.abspath(str(file_path or "")))
+        if not str(file_path or "").strip():
+            return None
+        rows = self._connection().execute(
+            "SELECT * FROM materials WHERE TRIM(file_path) <> ''"
+        ).fetchall()
+        for row in rows:
+            current = os.path.normcase(os.path.abspath(str(row["file_path"])))
+            if current == wanted:
+                return dict(row)
+        return None
+
+    def relocate_paths(self, old_dir: str | Path, new_dir: str | Path) -> int:
+        """Aggiorna i percorsi salvati dopo lo spostamento di una cartella.
+
+        Riguarda ``materials.file_path`` e ``video_lessons.transcript_path``:
+        ogni percorso dentro ``old_dir`` viene riscritto sotto ``new_dir``.
+        """
+        old_root = os.path.normcase(os.path.abspath(str(old_dir))).rstrip("\\/")
+        new_root = Path(new_dir)
+        connection = self._connection()
+        changed = 0
+        for table, column in (("materials", "file_path"), ("video_lessons", "transcript_path")):
+            rows = connection.execute(
+                f"SELECT id, {column} AS value FROM {table} WHERE TRIM({column}) <> ''"
+            ).fetchall()
+            for row in rows:
+                raw = os.path.abspath(str(row["value"]))
+                normalized = os.path.normcase(raw)
+                if normalized != old_root and not normalized.startswith(old_root + os.sep):
+                    continue
+                relative = raw[len(old_root):].lstrip("\\/")
+                target = str(new_root / relative) if relative else str(new_root)
+                connection.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                    (target, int(row["id"])),
+                )
+                changed += 1
+        return changed
 
     def delete_material(self, material_id: int) -> None:
         self._connection().execute("DELETE FROM materials WHERE id = ?", (int(material_id),))
@@ -1365,6 +1408,7 @@ class Database:
                     "video_lessons",
                     "flashcards",
                     "calendar_events",
+                    "doubts",
                 ):
                     connection.execute(
                         f"UPDATE {table} SET subject = ? "
