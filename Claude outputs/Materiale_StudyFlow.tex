@@ -1,0 +1,104 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[utf8]{inputenc}    
+\usepackage[T1]{fontenc}       
+\usepackage[italian]{babel}    
+\usepackage{graphicx}
+\usepackage{lmodern}  
+\usepackage{titlesec}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[most]{tcolorbox} % Carica il pacchetto (e anche xcolor)
+\usepackage{listings}
+\usepackage{geometry} % Caricato una sola volta
+
+% Impostazioni margini
+\geometry{top=2.5cm, bottom=2.5cm, left=2cm, right=2cm}
+
+% Impostazioni indice
+\usepackage[hidelinks]{hyperref} % Meglio caricarlo verso la fine
+
+% Impostazioni per liste compatte
+\setlist[itemize]{nosep} % Rende tutti gli itemize compatti
+\setlist[enumerate]{nosep} % Rende tutti gli enumerate compatti
+
+% --- Definizioni personalizzate ---
+
+% Definisco un nuovo box chiamato "graybox" (dalle tue impostazioni)
+\newtcolorbox{graybox}{
+  colback=gray!20,  % Colore di sfondo (20% grigio)
+  colframe=gray!20, % Colore del bordo (uguale allo sfondo per nasconderlo)
+  boxrule=0pt,      % Spessore del bordo (0 = nessuno)
+  sharp corners,    % Angoli squadrati (non arrotondati)
+  boxsep=2pt,       % Un po' di padding interno
+  left=2pt,         % Padding sinistro
+  right=2pt         % Padding destro
+}
+
+% Definizioni per Listings (dalle tue aggiunte)
+\definecolor{codegray}{gray}{0.95}
+\definecolor{codegreen}{rgb}{0.0, 0.5, 0.0} % Per i commenti
+\definecolor{codered}{rgb}{0.9, 0.0, 0.0}   % Per le stringhe
+\definecolor{codeblue}{rgb}{0.0, 0.0, 0.9}   % Per le parole chiave
+
+\lstdefinestyle{mycodestyle}{
+    backgroundcolor=\color{codegray}, % Colore di sfondo
+    basicstyle=\small\ttfamily,       % Stile del testo del codice (dimensione piccola, font a spaziatura fissa)
+    breaklines=true,                  % Permette al codice di andare a capo
+    frame=single,                     % Aggiunge un bordo singolo
+    framesep=5pt,                     % Spazio tra il bordo e il codice
+    framerule=0.5pt,                  % Spessore del bordo
+    rulecolor=\color{orange!70},     % Colore del bordo (arancione come nel tuo esempio)
+    numbers=left,                     % Numerazione delle righe a sinistra
+    numberstyle=\tiny\color{gray},    % Stile dei numeri di riga
+    stepnumber=1,                     % Incremento dei numeri di riga
+    numbersep=8pt,                    % Spazio tra numeri e codice
+    showspaces=false,                 % Non mostrare spazi come simboli
+    showtabs=false,                   % Non mostrare tab come simboli
+    showstringspaces=false,           % Non mostrare spazi nelle stringhe
+    commentstyle=\color{codegreen}\textit, % Stile per i commenti (verde, corsivo)
+    keywordstyle=\color{codeblue}\bfseries, % Stile per le parole chiave (blu, grassetto)
+    stringstyle=\color{codered},      % Stile per le stringhe (rosso)
+}
+
+\title{}
+\author{Andrea Gioia}
+\date{Anno Accademico 2025/2026}
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    \vspace*{1.5cm}
+    
+    {\scshape\LARGE Universit\`a degli Studi di Udine \par}
+    \vspace{0.4cm}
+    
+    {\scshape\Large Dipartimento di Scienze Matematiche, Informatiche e Fisiche\par}
+    \vspace{0.4cm}
+    {\large IBML - Internet of Things, Big Data, Machine Learning \par}
+    \vspace{0.4cm}
+    
+    \vspace{1.5cm}
+    \includegraphics[width=0.25\textwidth]{immagini/Logo.pdf}\par
+    \vspace{1cm}
+    
+    \rule{\textwidth}{0.5pt}\vspace{0.4cm}
+    {\Huge\bfseries MATERIA \par}
+    \vspace{0.4cm}
+    \rule{\textwidth}{0.5pt}
+    \vfill
+    
+    \vspace*{1cm}
+\end{titlepage}
+
+\newpage
+\tableofcontents
+\newpage
+
+% 00: Capitolo
+% STUDYFLOW:CONTENUTO
+\end{document}

@@ -212,7 +212,7 @@ class ExportTests(unittest.TestCase):
         options = RenderOptions(include_preamble=False)
         body = markdown_to_latex(SAMPLE, options)
         self.assertIn("% === Slide 1 ===", body)
-        self.assertIn("\\section*{Titolo \\& prova}", body)
+        self.assertIn("\\section{Titolo \\& prova}", body)
         self.assertIn("costo 30\\$", body)
         self.assertIn("\\begin{itemize}\n  \\item primo\n  \\begin{itemize}\n    \\item annidato", body)
         self.assertIn("\\begin{enumerate}", body)

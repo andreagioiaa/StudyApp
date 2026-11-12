@@ -97,6 +97,12 @@ class RenderOptions:
     docx_page_breaks: bool = False
     title: str = ""
     language: str = "italian"
+    # Struttura LaTeX
+    numbered_sections: bool = True
+    embed: bool = False            # inglobazione in un altro documento (solo frammento)
+    base_level: str = "section"    # livello della sezione radice se ``embed``
+    root_title: str = ""           # titolo della sezione radice se ``embed``
+    template: str = ""             # contenuto di un template .tex (documento autonomo)
 
 
 # ---------------------------------------------------------------------------

@@ -87,8 +87,10 @@ class StudyFlowApp(ctk.CTk):
         self.report_callback_exception = self._report_exception
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self._nav_mode = ""
+        self._nav_layout_job: str | None = None
         self._build_sidebar()
         self._build_content()
         self._build_toast()
@@ -124,116 +126,124 @@ class StudyFlowApp(ctk.CTk):
         except (AttributeError, OSError):
             pass
 
+    # Voci di navigazione: (chiave, icona, etichetta, etichetta breve)
+    NAV_ITEMS = (
+        ("pomodoro", "◷", "Pomodoro", "Pomodoro"),
+        ("audio", "♫", "Audio", "Audio"),
+        ("videos", "▷", "Video e Trascrizione", "Video"),
+        ("pdf", "▤", "PDF e Slide", "PDF"),
+        ("blocker", "◈", "Blocco distrazioni", "Blocco"),
+        ("calendar", "▦", "Calendario", "Calendario"),
+        ("subjects", "▥", "Materie", "Materie"),
+        ("flashcards", "▣", "Flashcard", "Flashcard"),
+        ("analytics", "◔", "Analisi", "Analisi"),
+        ("settings", "⚙", "Impostazioni", "Impostazioni"),
+    )
+
     def _build_sidebar(self) -> None:
-        sidebar = ctk.CTkFrame(
-            self,
-            width=230,
-            corner_radius=0,
-            fg_color=COLORS.sidebar,
-            border_width=0,
-        )
-        sidebar.grid(row=0, column=0, sticky="nsw")
-        sidebar.grid_propagate(False)
-        sidebar.grid_rowconfigure(2, weight=1)
+        """Barra di navigazione in alto: marchio, sezioni affiancate e stato del blocco.
 
-        brand = ctk.CTkFrame(sidebar, fg_color="transparent")
-        brand.grid(row=0, column=0, sticky="ew", padx=20, pady=(26, 22))
+        Se la finestra e' stretta le etichette si accorciano e, al limite,
+        restano solo le icone (vedi ``_layout_nav``).
+        """
+        bar = ctk.CTkFrame(self, height=58, corner_radius=0, fg_color=COLORS.sidebar, border_width=0)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_propagate(False)
+        bar.grid_rowconfigure(0, weight=1)
+        bar.grid_columnconfigure(1, weight=1)
+        self.topbar = bar
+
+        brand = ctk.CTkFrame(bar, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="w", padx=(18, 14))
+        ctk.CTkLabel(brand, text="StudyFlow", font=font(17, "bold"), text_color=COLORS.text, anchor="w").pack(
+            anchor="w"
+        )
         ctk.CTkLabel(
-            brand,
-            text="StudyFlow",
-            font=font(23, "bold"),
-            text_color=COLORS.text,
-            anchor="w",
+            brand, text=f"v{APP_VERSION} · locale e offline", font=font(9), text_color=COLORS.accent, anchor="w",
         ).pack(anchor="w")
-        ctk.CTkLabel(
-            brand,
-            text="Studio & Analytics",
-            font=font(10),
-            text_color=COLORS.accent,
-            anchor="w",
-        ).pack(anchor="w", pady=(2, 0))
 
-        nav = ctk.CTkFrame(sidebar, fg_color="transparent")
-        nav.grid(row=1, column=0, sticky="ew", padx=12)
-        nav.grid_columnconfigure(0, weight=1)
-        items = (
-            ("pomodoro", "◷", "Pomodoro"),
-            ("audio", "♫", "Audio"),
-            ("videos", "▷", "Video e Trascrizione"),
-            ("pdf", "▤", "PDF e Slide"),
-            ("blocker", "◈", "Blocco distrazioni"),
-            ("calendar", "▦", "Calendario"),
-            ("subjects", "▥", "Materie"),
-            ("flashcards", "▣", "Flashcard"),
-            ("analytics", "◔", "Analisi"),
-            ("settings", "⚙", "Impostazioni"),
-        )
-        for row, (key, icon, label) in enumerate(items):
+        nav = ctk.CTkFrame(bar, fg_color="transparent")
+        nav.grid(row=0, column=1, sticky="w")
+        self.nav_frame = nav
+        for column, (key, icon, label, _short) in enumerate(self.NAV_ITEMS):
             button = ctk.CTkButton(
                 nav,
-                text=f"  {icon}   {label}",
-                height=40,
-                font=font(12, "bold"),
+                text=f"{icon}  {label}",
+                width=20,
+                height=36,
+                font=font(11, "bold"),
                 fg_color="transparent",
                 hover_color=COLORS.surface_alt,
                 text_color=COLORS.text_muted,
-                anchor="w",
                 corner_radius=9,
                 command=lambda view_key=key: self.show_view(view_key),
             )
-            button.grid(row=row, column=0, sticky="ew", pady=2)
-            if key == "videos":
-                button.configure(font=font(11, "bold"))
+            button.grid(row=0, column=column, padx=1)
             self._nav_buttons[key] = button
 
-        bottom = ctk.CTkFrame(sidebar, fg_color="transparent")
-        bottom.grid(row=3, column=0, sticky="sew", padx=16, pady=18)
         status_card = ctk.CTkFrame(
-            bottom,
-            fg_color=COLORS.surface,
-            corner_radius=12,
-            border_width=1,
-            border_color=COLORS.border,
+            bar, fg_color=COLORS.surface, corner_radius=10, border_width=1, border_color=COLORS.border,
         )
-        status_card.pack(fill="x")
-        status_header = ctk.CTkFrame(status_card, fg_color="transparent")
-        status_header.pack(fill="x", padx=12, pady=(10, 2))
-        self.status_dot = ctk.CTkLabel(
-            status_header,
-            text="●",
-            font=font(11),
-            text_color=COLORS.text_faint,
-            width=14,
-        )
-        self.status_dot.pack(side="left")
+        status_card.grid(row=0, column=2, sticky="e", padx=(10, 14), pady=8)
+        self.status_dot = ctk.CTkLabel(status_card, text="●", font=font(11), text_color=COLORS.text_faint, width=14)
+        self.status_dot.grid(row=0, column=0, rowspan=2, padx=(10, 2))
         self.status_title = ctk.CTkLabel(
-            status_header,
-            text="Blocco inattivo",
-            font=font(10, "bold"),
-            text_color=COLORS.text_muted,
+            status_card, text="Blocco inattivo", font=font(10, "bold"), text_color=COLORS.text_muted, anchor="w",
+            height=16,
         )
-        self.status_title.pack(side="left", padx=(3, 0))
+        self.status_title.grid(row=0, column=1, sticky="w", padx=(2, 10), pady=(4, 0))
         self.status_detail = ctk.CTkLabel(
-            status_card,
-            text="Si attiva con il Pomodoro",
-            font=font(9),
-            text_color=COLORS.text_faint,
-            wraplength=180,
-            justify="left",
-            anchor="w",
+            status_card, text="Si attiva con il Pomodoro", font=font(9), text_color=COLORS.text_faint, anchor="w",
+            height=14,
         )
-        self.status_detail.pack(fill="x", padx=12, pady=(1, 10))
-        ctk.CTkLabel(
-            bottom,
-            text=f"v{APP_VERSION} · locale e offline",
-            font=font(9),
-            text_color=COLORS.text_faint,
-            anchor="w",
-        ).pack(anchor="w", padx=6, pady=(10, 0))
+        self.status_detail.grid(row=1, column=1, sticky="w", padx=(2, 10), pady=(0, 4))
+        self.status_card = status_card
+
+        bar.bind("<Configure>", lambda _e: self._schedule_nav_layout())
+        self.after(50, self._layout_nav)
+
+    def _schedule_nav_layout(self) -> None:
+        if self._nav_layout_job is not None:
+            try:
+                self.after_cancel(self._nav_layout_job)
+            except (tk.TclError, ValueError):
+                pass
+        self._nav_layout_job = self.after(40, self._layout_nav)
+
+    def _nav_texts(self, mode: str) -> dict[str, str]:
+        texts = {}
+        for key, icon, label, short in self.NAV_ITEMS:
+            if mode == "full":
+                texts[key] = f"{icon}  {label}"
+            elif mode == "short":
+                texts[key] = f"{icon} {short}"
+            else:
+                texts[key] = icon
+        return texts
+
+    def _layout_nav(self) -> None:
+        """Sceglie etichette complete, brevi o solo icone in base alla larghezza."""
+        self._nav_layout_job = None
+        try:
+            available = self.topbar.winfo_width()
+            if available <= 1:
+                return
+            fixed = self.topbar.grid_slaves(row=0, column=0)[0].winfo_reqwidth() + self.status_card.winfo_reqwidth() + 58
+            for mode in ("full", "short", "icons"):
+                texts = self._nav_texts(mode)
+                for key, button in self._nav_buttons.items():
+                    if button.cget("text") != texts[key]:
+                        button.configure(text=texts[key], width=36 if mode == "icons" else 20)
+                self.nav_frame.update_idletasks()
+                if self.nav_frame.winfo_reqwidth() + fixed <= available or mode == "icons":
+                    self._nav_mode = mode
+                    break
+        except tk.TclError:
+            pass
 
     def _build_content(self) -> None:
         self.content = ctk.CTkFrame(self, fg_color=COLORS.bg, corner_radius=0)
-        self.content.grid(row=0, column=1, sticky="nsew")
+        self.content.grid(row=1, column=0, sticky="nsew")
         self.content.grid_rowconfigure(0, weight=1)
         self.content.grid_columnconfigure(0, weight=1)
         # Tutte le viste vengono create all'avvio e restano in vita fino alla

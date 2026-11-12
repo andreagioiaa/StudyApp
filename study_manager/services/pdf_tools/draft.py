@@ -22,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 DRAFT_VERSION = 1
 DRAFT_FILENAME = "pdf_draft.json"
 
-_DOC_FIELDS = ("path", "title", "source", "fmt", "warnings", "engines", "error")
+_DOC_FIELDS = ("path", "title", "source", "fmt", "warnings", "engines", "error", "latex")
 
 
 def default_draft_path() -> Path:
@@ -42,6 +42,7 @@ def _clean_doc(raw: Any) -> dict[str, Any] | None:
         "warnings": [str(item) for item in raw.get("warnings", []) if item] if isinstance(raw.get("warnings"), list) else [],
         "engines": {str(k): int(v) for k, v in raw.get("engines", {}).items()} if isinstance(raw.get("engines"), dict) else {},
         "error": str(raw.get("error", "")),
+        "latex": dict(raw["latex"]) if isinstance(raw.get("latex"), dict) else {},
     }
 
 

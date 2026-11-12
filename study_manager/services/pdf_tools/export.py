@@ -27,6 +27,19 @@ from pathlib import Path
 
 from ...paths import app_data_dir, resource_path
 from ...utils import atomic_write_text
+from .inline import (
+    STYLE_BOLD,
+    STYLE_COLOR,
+    STYLE_ITALIC,
+    STYLE_MONO,
+    STYLE_UNDERLINE,
+    Math,
+    Node,
+    parse_inline,
+    plain_text,
+    preview_color,
+    uses_color,
+)
 from .document import (
     BLOCK_BULLET,
     BLOCK_HEADING,
@@ -38,7 +51,6 @@ from .document import (
     Slide,
     parse_markdown,
     split_inline_math,
-    strip_inline_markup,
     unescape_text,
 )
 from .mathconv import ALL_SYMBOLS, latex_to_unicode
@@ -104,29 +116,31 @@ def latex_escape(text: str) -> str:
     return "".join(out)
 
 
-_EMPHASIS_RE = re.compile(r"(\*\*[^*]+?\*\*|(?<![\w*])\*(?!\s)[^*]+?(?<!\s)\*(?![\w*]))")
+_LATEX_COMMANDS = {
+    STYLE_BOLD: "textbf",
+    STYLE_ITALIC: "emph",
+    STYLE_UNDERLINE: "underline",
+    STYLE_MONO: "texttt",
+}
 
 
-def _text_to_latex(text: str) -> str:
-    text = unescape_text(text)
+def _nodes_to_latex(nodes: list[Node]) -> str:
     out: list[str] = []
-    for token in _EMPHASIS_RE.split(text):
-        if not token:
-            continue
-        if token.startswith("**") and token.endswith("**") and len(token) > 4:
-            out.append(rf"\textbf{{{latex_escape(token[2:-2])}}}")
-        elif token.startswith("*") and token.endswith("*") and len(token) > 2:
-            out.append(rf"\emph{{{latex_escape(token[1:-1])}}}")
+    for node in nodes:
+        if isinstance(node, str):
+            out.append(latex_escape(unescape_text(node)))
+        elif isinstance(node, Math):
+            out.append(f"${node.content}$")
+        elif node.style == STYLE_COLOR:
+            model = f"[{node.model}]" if node.model else ""
+            out.append(f"\\textcolor{model}{{{node.value}}}{{{_nodes_to_latex(node.children)}}}")
         else:
-            out.append(latex_escape(token))
+            out.append(f"\\{_LATEX_COMMANDS[node.style]}{{{_nodes_to_latex(node.children)}}}")
     return "".join(out)
 
 
 def inline_to_latex(text: str) -> str:
-    parts = []
-    for is_math, content in split_inline_math(text):
-        parts.append(f"${content}$" if is_math else _text_to_latex(content))
-    return "".join(parts)
+    return _nodes_to_latex(parse_inline(text))
 
 
 def _table_rows(text: str) -> list[list[str]]:
@@ -141,6 +155,147 @@ def _table_rows(text: str) -> list[list[str]]:
 
 def _list_env(kind: str) -> str:
     return "itemize" if kind == BLOCK_BULLET else "enumerate"
+
+
+# ---------------------------------------------------------------------------
+# Struttura delle sezioni
+# ---------------------------------------------------------------------------
+SECTION_LEVELS = ("part", "chapter", "section", "subsection", "subsubsection", "paragraph", "subparagraph")
+SECTION_LEVEL_LABELS = {
+    "part": "\\part",
+    "chapter": "\\chapter",
+    "section": "\\section",
+    "subsection": "\\subsection",
+    "subsubsection": "\\subsubsection",
+    "paragraph": "\\paragraph",
+}
+CONTENT_MARKER = "% STUDYFLOW:CONTENUTO"
+TITLE_PLACEHOLDER = "{{TITOLO}}"
+
+
+def _level_index(name: str) -> int:
+    return SECTION_LEVELS.index(name) if name in SECTION_LEVELS else SECTION_LEVELS.index("section")
+
+
+def first_heading_index(options: RenderOptions | None) -> int:
+    """Indice in ``SECTION_LEVELS`` del comando usato per i titoli ``#``.
+
+    Documento autonomo: ``#`` -> \\section. Inglobazione: la radice usa
+    ``base_level`` e i titoli partono dal livello subito sotto.
+    """
+    if options is None or not options.embed:
+        return _level_index("section")
+    return min(_level_index(options.base_level) + 1, len(SECTION_LEVELS) - 1)
+
+
+def heading_command(markdown_level: int, options: RenderOptions) -> str:
+    index = min(first_heading_index(options) + max(1, markdown_level) - 1, len(SECTION_LEVELS) - 1)
+    star = "" if options.numbered_sections else "*"
+    return f"{SECTION_LEVELS[index]}{star}"
+
+
+def latex_root_heading(options: RenderOptions) -> str:
+    """Sezione radice dell'inglobazione (es. ``\\section{Nome documento}``)."""
+    if not options.embed:
+        return ""
+    title = (options.root_title or options.title).strip()
+    if not title:
+        return ""
+    star = "" if options.numbered_sections else "*"
+    return f"\\{_level_name(options.base_level)}{star}{{{latex_escape(title)}}}\n\n"
+
+
+def _level_name(name: str) -> str:
+    return name if name in SECTION_LEVELS else "section"
+
+
+# Numerazione come la produce LaTeX (classe article/report, secnumdepth 3).
+_ROMAN = ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+          (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"))
+_NUMBERED_DEPTH = SECTION_LEVELS.index("subsubsection")
+_HEADING_SCAN_RE = re.compile(
+    r"\\(part|chapter|section|subsection|subsubsection|paragraph|subparagraph)(\*?)\s*(?:\[[^\]]*\])?\s*\{"
+)
+
+
+def _roman(value: int) -> str:
+    out = []
+    for number, letters in _ROMAN:
+        while value >= number:
+            out.append(letters)
+            value -= number
+    return "".join(out)
+
+
+class SectionNumbering:
+    """Contatori delle sezioni, con le stesse regole di LaTeX.
+
+    ``\\chapter`` azzera ``section``, ``section`` azzera ``subsection`` e cosi'
+    via; ``\\part`` non azzera i livelli sotto. ``paragraph`` e ``subparagraph``
+    non sono numerati (come in article con secnumdepth predefinito).
+    """
+
+    def __init__(self, language: str = "italian"):
+        self.counts = [0] * len(SECTION_LEVELS)
+        self.has_chapter = False
+        self.italian = (language or "italian").startswith("ital")
+
+    def step(self, level: str, starred: bool = False) -> str:
+        """Avanza il contatore del livello e restituisce l'etichetta ('' se non numerata)."""
+        index = SECTION_LEVELS.index(level) if level in SECTION_LEVELS else SECTION_LEVELS.index("section")
+        if starred or index > _NUMBERED_DEPTH:
+            return ""
+        self.counts[index] += 1
+        if index > 0:  # \part non azzera i livelli sotto
+            for lower in range(index + 1, len(SECTION_LEVELS)):
+                self.counts[lower] = 0
+        if index == 0:
+            return f"{'Parte' if self.italian else 'Part'} {_roman(self.counts[0])}"
+        if index == 1:
+            self.has_chapter = True
+            return f"{'Capitolo' if self.italian else 'Chapter'} {self.counts[1]}"
+        first = 1 if self.has_chapter else 2
+        return ".".join(str(self.counts[i]) for i in range(first, index + 1))
+
+    def scan(self, latex: str) -> None:
+        """Avanza i contatori per le sezioni gia' presenti in un testo LaTeX (commenti esclusi)."""
+        for line in latex.split("\n"):
+            code = re.sub(r"(?<!\\)%.*$", "", line)
+            for match in _HEADING_SCAN_RE.finditer(code):
+                self.step(match.group(1), starred=bool(match.group(2)))
+
+
+def template_prefix(template: str) -> str:
+    """Parte del template che precede il punto in cui verra' inserito il contenuto."""
+    text = template.replace("\r\n", "\n")
+    begin = text.find("\\begin{document}")
+    if begin == -1:
+        return ""
+    for line_start, line in _iter_lines(text):
+        if line.strip() == CONTENT_MARKER:
+            return text[begin:line_start]
+    end = text.rfind("\\end{document}")
+    return text[begin:end if end != -1 else None]
+
+
+def _iter_lines(text: str):
+    position = 0
+    for line in text.split("\n"):
+        yield position, line
+        position += len(line) + 1
+
+
+def numbering_for(options: RenderOptions) -> SectionNumbering:
+    """Contatori pronti per l'anteprima: se il documento autonomo usa un template,
+    si parte dopo le sezioni gia' presenti nel template (altrimenti da 1)."""
+    numbering = SectionNumbering(options.language)
+    if options.template.strip() and options.include_preamble and not options.embed:
+        numbering.scan(template_prefix(options.template))
+    return numbering
+
+
+def heading_level_name(markdown_level: int, options: RenderOptions) -> str:
+    return heading_command(markdown_level, options).rstrip("*")
 
 
 def slides_to_latex_body(slides: list[Slide], options: RenderOptions) -> str:
@@ -177,8 +332,8 @@ def slides_to_latex_body(slides: list[Slide], options: RenderOptions) -> str:
             if block.kind == BLOCK_HEADING:
                 if not options.include_headings:
                     continue
-                command = {1: "section", 2: "subsection"}.get(block.level, "subsubsection")
-                lines.append(f"\\{command}*{{{inline_to_latex(block.text)}}}")
+                command = heading_command(min(block.level, 3), options)
+                lines.append(f"\\{command}{{{inline_to_latex(block.text)}}}")
             elif block.kind == BLOCK_MATH:
                 formula = block.text.strip()
                 if "\\\\" in formula and "\\begin" not in formula:
@@ -216,6 +371,7 @@ LATEX_PREAMBLE = r"""\documentclass[11pt,a4paper]{article}
 \usepackage{amssymb}
 \usepackage{amsfonts}
 \usepackage{textcomp}
+\usepackage{xcolor}
 \usepackage[margin=2.5cm]{geometry}
 \usepackage[hidelinks]{hyperref}
 \setlength{\parindent}{0pt}
@@ -223,9 +379,68 @@ LATEX_PREAMBLE = r"""\documentclass[11pt,a4paper]{article}
 """
 
 
+_REQUIRED_PACKAGES = ("amsmath", "amssymb")
+
+
+def _template_uses_package(template: str, package: str) -> bool:
+    for match in re.finditer(r"^[^%\n]*\\usepackage(?:\[[^\]]*\])?\{([^}]*)\}", template, re.MULTILINE):
+        if package in [item.strip() for item in match.group(1).split(",")]:
+            return True
+    return False
+
+
+def apply_template(template: str, body: str, options: RenderOptions) -> str:
+    """Inserisce ``body`` in un template .tex dell'utente.
+
+    - il contenuto va al posto della riga ``% STUDYFLOW:CONTENUTO`` se presente,
+      altrimenti subito prima di ``\\end{document}``;
+    - ``{{TITOLO}}`` e un ``\\title{}`` vuoto vengono riempiti con il titolo;
+    - se mancano, ``amsmath`` e ``amssymb`` (servono alle formule) vengono
+      aggiunti prima di ``\\begin{document}``.
+    """
+    text = template.replace("\r\n", "\n")
+    if "\\begin{document}" not in text:
+        raise ExportError("Il template non contiene \\begin{document}.")
+    title = latex_escape(options.title.strip()) if options.title else ""
+    text = text.replace(TITLE_PLACEHOLDER, title)
+    if title:
+        text = re.sub(r"\\title\{\s*\}", lambda _m: f"\\title{{{title}}}", text, count=1)
+    missing = [pkg for pkg in _REQUIRED_PACKAGES if not _template_uses_package(text, pkg)]
+    if uses_color(body) and not any(
+        _template_uses_package(text, pkg) for pkg in ("xcolor", "color", "tcolorbox", "tikz", "pgf")
+    ):
+        missing.append("xcolor")
+    if missing:
+        extra = "".join(f"\\usepackage{{{pkg}}} % aggiunto da StudyFlow\n" for pkg in missing)
+        index = text.find("\\begin{document}")
+        text = text[:index] + extra + text[index:]
+    content = body.strip() + "\n"
+    lines = text.split("\n")
+    for position, line in enumerate(lines):
+        if line.strip() == CONTENT_MARKER:
+            lines[position] = content.rstrip("\n")
+            return "\n".join(lines).rstrip() + "\n"
+    end = text.rfind("\\end{document}")
+    if end == -1:
+        return text.rstrip() + "\n\n" + content + "\n\\end{document}\n"
+    head = text[:end].rstrip()
+    return head + "\n\n" + content + "\n" + text[end:].rstrip() + "\n"
+
+
+def finalize_latex(body: str, options: RenderOptions, full: bool | None = None, root: bool = True) -> str:
+    """Aggiunge la sezione radice (inglobazione) e, se serve, preambolo o template."""
+    if root:
+        body = latex_root_heading(options) + body
+    if full is None:
+        full = options.include_preamble and not options.embed
+    return wrap_latex_document(body, options) if full else body
+
+
 def wrap_latex_document(body: str, options: RenderOptions) -> str:
     if "\\documentclass" in body:
         return body
+    if options.template.strip():
+        return apply_template(options.template, body, options)
     preamble = LATEX_PREAMBLE % {"language": options.language or "italian"}
     parts = [preamble]
     if options.title:
@@ -237,10 +452,12 @@ def wrap_latex_document(body: str, options: RenderOptions) -> str:
     return "".join(parts)
 
 
-def markdown_to_latex(markdown: str, options: RenderOptions, full: bool | None = None) -> str:
+def markdown_to_latex(
+    markdown: str, options: RenderOptions, full: bool | None = None, root: bool = True
+) -> str:
+    """Markdown -> LaTeX. ``root=False`` omette la sezione radice (editor LaTeX)."""
     body = slides_to_latex_body(parse_markdown(markdown), options)
-    use_full = options.include_preamble if full is None else full
-    return wrap_latex_document(body, options) if use_full else body
+    return finalize_latex(body, options, full, root)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +483,9 @@ _DISPLAY_ENVS = {
     "align": "aligned", "align*": "aligned", "eqnarray": "aligned", "eqnarray*": "aligned",
     "gather": "gathered", "gather*": "gathered", "multline": None, "multline*": None,
 }
-_SECTION_RE = re.compile(r"^\\(section|subsection|subsubsection|paragraph)\*?\{(.*)\}\s*$")
+_SECTION_RE = re.compile(
+    r"^\\(part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?\{(.*)\}\s*$"
+)
 _ITEM_RE = re.compile(r"^\\item(?:\[[^\]]*\])?\s*(.*)$")
 _DROP_RE = re.compile(
     r"^\\(maketitle|tableofcontents|centering|noindent|newpage|clearpage|pagebreak|hline|"
@@ -286,7 +505,7 @@ def _latex_text_to_markdown(text: str) -> str:
         for _ in range(3):
             segment = re.sub(r"\\textbf\{([^{}]*)\}", r"**\1**", segment)
             segment = re.sub(r"\\(?:emph|textit)\{([^{}]*)\}", r"*\1*", segment)
-            segment = re.sub(r"\\(?:texttt|textrm|textsf|underline|mbox|text)\{([^{}]*)\}", r"\1", segment)
+            segment = re.sub(r"\\(?:textrm|textsf|mbox|text)\{([^{}]*)\}", r"\1", segment)
         segment = segment.replace("\\$", "\x00")
         for source, target in _LATEX_UNESCAPE:
             segment = segment.replace(source, target)
@@ -296,7 +515,7 @@ def _latex_text_to_markdown(text: str) -> str:
     return "".join(parts).strip()
 
 
-def latex_to_markdown(tex: str) -> str:
+def latex_to_markdown(tex: str, options: RenderOptions | None = None) -> str:
     """Converte LaTeX (anche generato da questo modulo) nel formato sorgente."""
     text = tex.replace("\r\n", "\n")
     begin = text.find("\\begin{document}")
@@ -398,7 +617,8 @@ def latex_to_markdown(tex: str) -> str:
             continue
         section = _SECTION_RE.match(line)
         if section:
-            level = {"section": "#", "subsection": "##", "subsubsection": "###"}.get(section.group(1))
+            depth = SECTION_LEVELS.index(section.group(1)) - first_heading_index(options) + 1
+            level = "#" * depth if 1 <= depth <= 3 else None
             title = _latex_text_to_markdown(section.group(2))
             out.extend(["", f"{level} {title}" if level else f"**{title}**", ""])
             continue
@@ -418,10 +638,7 @@ def latex_to_markdown(tex: str) -> str:
 # Testo semplice
 # ---------------------------------------------------------------------------
 def _inline_to_plain(text: str) -> str:
-    parts = []
-    for is_math, content in split_inline_math(text):
-        parts.append(latex_to_unicode(content) if is_math else strip_inline_markup(unescape_text(content)))
-    return re.sub(r"[ ]{2,}", " ", "".join(parts)).strip()
+    return re.sub(r"[ ]{2,}", " ", plain_text(parse_inline(text), latex_to_unicode)).strip()
 
 
 def slides_to_txt(slides: list[Slide], options: RenderOptions) -> str:
@@ -466,29 +683,39 @@ def markdown_to_txt(markdown: str, options: RenderOptions) -> str:
 # ---------------------------------------------------------------------------
 # Pandoc / Word
 # ---------------------------------------------------------------------------
-def _pandoc_text(text: str) -> str:
-    text = unescape_text(text)
+def _pandoc_escape(text: str) -> str:
+    text = unescape_text(text).replace("\\", "\\\\")
+    for char in "$<>^~`[]*_#@":
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def _nodes_to_pandoc(nodes: list[Node]) -> str:
     out: list[str] = []
-    for token in _EMPHASIS_RE.split(text):
-        if not token:
-            continue
-        if (token.startswith("**") and token.endswith("**") and len(token) > 4) or (
-            token.startswith("*") and token.endswith("*") and len(token) > 2
-        ):
-            out.append(token)
-            continue
-        token = token.replace("\\", "\\\\")
-        for char in "$<>^~`[]*_#@":
-            token = token.replace(char, "\\" + char)
-        out.append(token)
+    for node in nodes:
+        if isinstance(node, str):
+            out.append(_pandoc_escape(node))
+        elif isinstance(node, Math):
+            if node.content.strip():
+                out.append(f"${node.content.strip()}$")
+        elif node.style == STYLE_BOLD:
+            out.append(f"**{_nodes_to_pandoc(node.children)}**")
+        elif node.style == STYLE_ITALIC:
+            out.append(f"*{_nodes_to_pandoc(node.children)}*")
+        elif node.style == STYLE_UNDERLINE:
+            out.append(f"[{_nodes_to_pandoc(node.children)}]{{.underline}}")
+        elif node.style == STYLE_MONO:
+            code = plain_text(node.children, latex_to_unicode)
+            fence = "``" if "`" in code else "`"
+            pad = " " if code.startswith("`") or code.endswith("`") else ""
+            out.append(f"{fence}{pad}{code}{pad}{fence}")
+        else:  # colore: Word tramite Pandoc non lo supporta, resta il testo
+            out.append(_nodes_to_pandoc(node.children))
     return "".join(out)
 
 
 def _pandoc_inline(text: str) -> str:
-    parts = []
-    for is_math, content in split_inline_math(text):
-        parts.append(f"${content.strip()}$" if is_math and content.strip() else ("" if is_math else _pandoc_text(content)))
-    return "".join(parts)
+    return _nodes_to_pandoc(parse_inline(text))
 
 
 PAGE_BREAK_OPENXML = '```{=openxml}\n<w:p><w:r><w:br w:type="page"/></w:r></w:p>\n```'
@@ -637,9 +864,8 @@ def render_source(source: str, source_format: str, fmt: str, options: RenderOpti
     """Testo finale di un formato testuale (txt/tex) a partire dal sorgente."""
     if source_format == SOURCE_LATEX:
         if fmt == FORMAT_TEX:
-            body = source.strip() + "\n"
-            return wrap_latex_document(body, options) if options.include_preamble else body
-        return markdown_to_txt(latex_to_markdown(source), options)
+            return finalize_latex(source.strip() + "\n", options)
+        return markdown_to_txt(latex_to_markdown(source, options), options)
     if fmt == FORMAT_TEX:
         return markdown_to_latex(source, options)
     return markdown_to_txt(source, options)
@@ -667,18 +893,28 @@ def katex_available() -> bool:
     return (folder / "katex.min.js").is_file() and (folder / "contrib" / "auto-render.min.js").is_file()
 
 
+_HTML_TAGS = {STYLE_BOLD: "strong", STYLE_ITALIC: "em", STYLE_UNDERLINE: "u", STYLE_MONO: "code"}
+
+
+def _nodes_to_html(nodes: list[Node]) -> str:
+    out: list[str] = []
+    for node in nodes:
+        if isinstance(node, str):
+            escaped = html.escape(unescape_text(node), quote=False)
+            out.append(escaped.replace("$", '<span class="dollar">$</span>'))
+        elif isinstance(node, Math):
+            out.append(f"${html.escape(node.content, quote=False)}$")
+        elif node.style == STYLE_COLOR:
+            color = (f"#{node.value}" if node.model.upper() == "HTML" else preview_color(node.value)) or "inherit"
+            out.append(f'<span style="color:{html.escape(color)}">{_nodes_to_html(node.children)}</span>')
+        else:
+            tag = _HTML_TAGS[node.style]
+            out.append(f"<{tag}>{_nodes_to_html(node.children)}</{tag}>")
+    return "".join(out)
+
+
 def _html_inline(text: str) -> str:
-    parts = []
-    for is_math, content in split_inline_math(text):
-        if is_math:
-            parts.append(f"${html.escape(content, quote=False)}$")
-            continue
-        escaped = html.escape(unescape_text(content), quote=False)
-        escaped = escaped.replace("$", '<span class="dollar">$</span>')
-        escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-        escaped = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<em>\1</em>", escaped)
-        parts.append(escaped)
-    return "".join(parts)
+    return _nodes_to_html(parse_inline(text))
 
 
 def slides_to_html(slides: list[Slide], options: RenderOptions) -> str:
@@ -770,7 +1006,7 @@ def slides_to_html(slides: list[Slide], options: RenderOptions) -> str:
 
 
 def source_to_html(source: str, source_format: str, options: RenderOptions) -> str:
-    markdown = latex_to_markdown(source) if source_format == SOURCE_LATEX else source
+    markdown = latex_to_markdown(source, options) if source_format == SOURCE_LATEX else source
     return slides_to_html(parse_markdown(markdown), options)
 
 

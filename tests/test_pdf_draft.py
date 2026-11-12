@@ -18,6 +18,7 @@ DOC = {
     "warnings": ["OCR su 2 pagine"],
     "engines": {"pymupdf": 3},
     "error": "",
+    "latex": {"numbered": True, "embed": True, "base_level": "section", "root_title": "Lezione 1"},
 }
 
 
