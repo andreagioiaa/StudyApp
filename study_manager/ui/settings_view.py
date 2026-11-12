@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import threading
+import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import colorchooser, filedialog, messagebox
 
 import customtkinter as ctk
 
@@ -25,8 +26,11 @@ from ..services.calendar_sync import (
     format_elapsed,
 )
 from ..services.google_auth import GoogleAuthError
+from ..services.ical_feeds import FEED_COLORS, ICalFeedError
+from ..database import normalize_hex
 from ..services.uac import is_admin
 from ..utils import safe_float, safe_int
+from .calendar_help import TAB_API, TAB_ICAL, open_calendar_help
 from .theme import font
 from .widgets import Card, PageHeader, clear_children, separator
 
@@ -67,6 +71,7 @@ class SettingsView(ctk.CTkFrame):
         self._build_behavior_card(content)
         self._build_storage_card(content)
         self._build_backup_card(content)
+        self._build_ical_card(content)
         self._build_google_card(content)
         self._connecting = False
         self._cancel_connect: threading.Event | None = None
@@ -398,14 +403,15 @@ class SettingsView(ctk.CTkFrame):
 
     def _build_google_card(self, parent) -> None:
         card = Card(parent)
-        card.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        card.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             card,
-            text="Google Calendar",
+            text="Google Calendar tramite API (avanzato, bidirezionale)",
             font=font(16, "bold"),
             text_color=COLORS.text,
         ).grid(row=0, column=0, sticky="w", padx=22, pady=(18, 4))
+        self._help_button(card, TAB_API).grid(row=0, column=0, sticky="e", padx=22, pady=(16, 4))
         ctk.CTkLabel(
             card,
             text=(
@@ -529,6 +535,257 @@ class SettingsView(ctk.CTkFrame):
         )
         self.google_sync_label.pack(side="left", padx=14)
 
+    def _build_ical_card(self, parent) -> None:
+        card = Card(parent)
+        card.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            card,
+            text="Calendari tramite indirizzo iCal (senza API)",
+            font=font(16, "bold"),
+            text_color=COLORS.text,
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(18, 4))
+        self._help_button(card, TAB_ICAL).grid(row=0, column=0, sticky="e", padx=22, pady=(16, 4))
+        ctk.CTkLabel(
+            card,
+            text=(
+                "Per ogni calendario Google incolla il suo \"Indirizzo segreto in formato "
+                "iCal\" (Google Calendar dal computer > Impostazioni e condivisione > "
+                "Integra calendario). Nessun login: gli eventi vengono letti all'avvio e con "
+                "\"Sincronizza Ora\". E' in sola lettura: gli eventi creati in StudyFlow "
+                "restano locali. Gli indirizzi sono cifrati e non finiscono nel backup."
+            ),
+            font=font(11),
+            text_color=COLORS.text_muted,
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        ).grid(row=1, column=0, sticky="w", padx=22)
+        self.feeds_frame = ctk.CTkFrame(card, fg_color="transparent")
+        self.feeds_frame.grid(row=2, column=0, sticky="ew", padx=22, pady=(12, 6))
+        self.feeds_frame.grid_columnconfigure(1, weight=1)
+
+        add_row = ctk.CTkFrame(card, fg_color="transparent")
+        add_row.grid(row=3, column=0, sticky="ew", padx=22, pady=(6, 18))
+        add_row.grid_columnconfigure(0, weight=1)
+        self.feed_url_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            add_row,
+            textvariable=self.feed_url_var,
+            placeholder_text="https://calendar.google.com/calendar/ical/.../private-.../basic.ics",
+            height=36,
+            fg_color=COLORS.surface_alt,
+            border_color=COLORS.border,
+            text_color=COLORS.text,
+            font=font(11),
+            corner_radius=9,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.feed_subject_var = ctk.StringVar(value=NO_SUBJECT_CHOICE)
+        self.feed_subject_combo = ctk.CTkComboBox(
+            add_row,
+            values=[NO_SUBJECT_CHOICE],
+            variable=self.feed_subject_var,
+            width=230,
+            height=36,
+            font=font(11),
+            dropdown_font=font(11),
+            fg_color=COLORS.surface_alt,
+            border_color=COLORS.border,
+            button_color=COLORS.surface_hover,
+            button_hover_color=COLORS.border,
+            dropdown_fg_color=COLORS.surface,
+            text_color=COLORS.text,
+            corner_radius=9,
+        )
+        self.feed_subject_combo.grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(
+            add_row,
+            text="Aggiungi",
+            width=100,
+            height=36,
+            font=font(11, "bold"),
+            fg_color=COLORS.accent,
+            hover_color=COLORS.accent_hover,
+            text_color=COLORS.bg,
+            corner_radius=9,
+            command=self._add_feed,
+        ).grid(row=0, column=2)
+
+    def _help_button(self, parent, tab: str) -> ctk.CTkButton:
+        return ctk.CTkButton(
+            parent,
+            text="?  Come Connettere Calendario",
+            width=200,
+            height=30,
+            font=font(11),
+            fg_color="transparent",
+            hover_color=COLORS.surface_alt,
+            border_width=1,
+            border_color=COLORS.border,
+            text_color=COLORS.blue,
+            corner_radius=8,
+            command=lambda: open_calendar_help(self, self.app, initial=tab),
+        )
+
+    # --------------------------------------------------------------- ical
+    def _subject_choices(self) -> list[str]:
+        return [NO_SUBJECT_CHOICE, *self.db.list_subject_tags()]
+
+    def _render_ical(self) -> None:
+        clear_children(self.feeds_frame)
+        store = self._sync.ical
+        feeds = store.list_feeds()
+        choices = self._subject_choices()
+        self.feed_subject_combo.configure(values=choices)
+        if not feeds:
+            ctk.CTkLabel(
+                self.feeds_frame,
+                text="Nessun indirizzo iCal aggiunto. Vedi il README per come trovarlo.",
+                font=font(11),
+                text_color=COLORS.text_faint,
+            ).grid(row=0, column=0, columnspan=4, sticky="w", pady=2)
+            return
+        for row, feed in enumerate(feeds):
+            ctk.CTkButton(
+                self.feeds_frame,
+                text="",
+                width=24,
+                height=24,
+                corner_radius=12,
+                fg_color=feed["color"],
+                hover_color=feed["color"],
+                border_width=2,
+                border_color=COLORS.bg,
+                command=lambda value=feed["id"]: self._pick_feed_color(value),
+            ).grid(row=row, column=0, padx=(0, 10), pady=4, sticky="n")
+            info = ctk.CTkFrame(self.feeds_frame, fg_color="transparent")
+            info.grid(row=row, column=1, sticky="ew", pady=4)
+            ctk.CTkLabel(
+                info,
+                text=feed["name"] or "Calendario (nome dopo la prima sincronizzazione)",
+                font=font(11, "bold"),
+                text_color=COLORS.text,
+                anchor="w",
+            ).pack(anchor="w")
+            if not feed["has_url"]:
+                detail, detail_color = "Indirizzo mancante su questo PC: rimuovi e aggiungi di nuovo.", COLORS.amber
+            elif feed["error"]:
+                detail, detail_color = feed["error"], COLORS.red
+            else:
+                synced = format_elapsed(feed["last_ok"]) if feed["last_ok"] else "non ancora sincronizzato"
+                detail, detail_color = f"{feed['url_hint']} · {synced}", COLORS.text_faint
+            ctk.CTkLabel(
+                info,
+                text=detail,
+                font=font(9),
+                text_color=detail_color,
+                anchor="w",
+                wraplength=430,
+                justify="left",
+            ).pack(anchor="w")
+            current = feed["subject"] or NO_SUBJECT_CHOICE
+            subject_var = ctk.StringVar(value=current)
+            ctk.CTkComboBox(
+                self.feeds_frame,
+                values=choices if current in choices else [*choices, current],
+                variable=subject_var,
+                state="readonly",
+                width=230,
+                height=30,
+                font=font(11),
+                dropdown_font=font(11),
+                fg_color=COLORS.surface_alt,
+                border_color=COLORS.border,
+                button_color=COLORS.surface_hover,
+                button_hover_color=COLORS.border,
+                dropdown_fg_color=COLORS.surface,
+                text_color=COLORS.text,
+                corner_radius=8,
+                command=lambda value, feed_id=feed["id"]: self._set_feed_subject(feed_id, value),
+            ).grid(row=row, column=2, padx=(8, 8), pady=4, sticky="n")
+            ctk.CTkButton(
+                self.feeds_frame,
+                text="Rimuovi",
+                width=80,
+                height=30,
+                font=font(10),
+                fg_color="transparent",
+                hover_color=COLORS.red_dark,
+                border_width=1,
+                border_color=COLORS.border,
+                text_color=COLORS.red,
+                corner_radius=8,
+                command=lambda value=feed["id"]: self._remove_feed(value),
+            ).grid(row=row, column=3, pady=4, sticky="n")
+
+    def _resync_feeds(self) -> None:
+        if not self._sync.sync_async("settings"):
+            self.app.toast("Sincronizzazione gia' in corso: riprova tra poco.")
+        self._render_google()
+
+    def _add_feed(self) -> None:
+        subject = self.feed_subject_var.get().strip()
+        if subject == NO_SUBJECT_CHOICE:
+            subject = ""
+        if subject and self._sync.ical.for_subject(subject) is not None:
+            messagebox.showerror(
+                "Materia gia' collegata",
+                f"La materia \"{subject}\" ha gia' un indirizzo iCal.",
+                parent=self.winfo_toplevel(),
+            )
+            return
+        try:
+            self._sync.ical.add_feed(self.feed_url_var.get(), subject)
+        except ICalFeedError as exc:
+            messagebox.showerror("Indirizzo non valido", str(exc), parent=self.winfo_toplevel())
+            return
+        except Exception as exc:
+            self.app.logger.exception("Aggiunta indirizzo iCal non riuscita.")
+            messagebox.showerror("Indirizzo non valido", str(exc), parent=self.winfo_toplevel())
+            return
+        self.feed_url_var.set("")
+        self.feed_subject_var.set(NO_SUBJECT_CHOICE)
+        self.app.toast("Indirizzo iCal aggiunto. Sincronizzazione in corso...")
+        self._resync_feeds()
+
+    def _set_feed_subject(self, feed_id: str, value: str) -> None:
+        subject = "" if value == NO_SUBJECT_CHOICE else value
+        other = self._sync.ical.for_subject(subject) if subject else None
+        if other is not None and other["id"] != feed_id:
+            messagebox.showerror(
+                "Materia gia' collegata",
+                f"La materia \"{subject}\" ha gia' un indirizzo iCal.",
+                parent=self.winfo_toplevel(),
+            )
+            self._render_ical()
+            return
+        self._sync.ical.update_feed(feed_id, subject=subject)
+        self._resync_feeds()
+
+    def _pick_feed_color(self, feed_id: str) -> None:
+        feed = self._sync.ical.get(feed_id)
+        if feed is None:
+            return
+        _ColorPicker(self, feed["color"], lambda color: self._set_feed_color(feed_id, color))
+
+    def _set_feed_color(self, feed_id: str, color: str) -> None:
+        self._sync.ical.update_feed(feed_id, color=color)
+        self._resync_feeds()
+
+    def _remove_feed(self, feed_id: str) -> None:
+        feed = self._sync.ical.get(feed_id)
+        if feed is None:
+            return
+        if not messagebox.askyesno(
+            "Rimuovere il calendario?",
+            f"\"{feed['name'] or feed['url_hint']}\" verra' rimosso e i suoi eventi spariranno "
+            "dall'agenda alla prossima sincronizzazione. Sessioni e materiali restano. Continuare?",
+            parent=self.winfo_toplevel(),
+        ):
+            return
+        self._sync.ical.remove_feed(feed_id)
+        self._resync_feeds()
+
     # ------------------------------------------------------------- google
     @property
     def _sync(self):
@@ -568,6 +825,7 @@ class SettingsView(ctk.CTkFrame):
             text="Sincronizzazione in corso..." if sync.is_syncing else f"Ultima sincronizzazione: {last}"
         )
         self._render_calendar_rows()
+        self._render_ical()
 
     def _render_calendar_rows(self) -> None:
         clear_children(self.calendars_frame)
@@ -956,3 +1214,64 @@ class SettingsView(ctk.CTkFrame):
             os.startfile(str(folder))  # type: ignore[attr-defined]
         except (OSError, AttributeError):
             messagebox.showinfo("Cartella dati", str(folder), parent=self.winfo_toplevel())
+
+
+class _ColorPicker(ctk.CTkToplevel):
+    """Piccola tavolozza con i colori dei calendari Google, piu' un colore libero."""
+
+    def __init__(self, view: SettingsView, current: str, on_pick) -> None:
+        super().__init__(view.winfo_toplevel())
+        self._on_pick = on_pick
+        self.title("Colore del calendario")
+        self.configure(fg_color=COLORS.bg)
+        self.resizable(False, False)
+        self.transient(view.winfo_toplevel())
+        grid = ctk.CTkFrame(self, fg_color="transparent")
+        grid.pack(padx=18, pady=(18, 8))
+        for index, color in enumerate(FEED_COLORS):
+            ctk.CTkButton(
+                grid,
+                text="",
+                width=30,
+                height=30,
+                corner_radius=15,
+                fg_color=color,
+                hover_color=color,
+                border_width=2,
+                border_color=COLORS.text if color == current else COLORS.bg,
+                command=lambda value=color: self._choose(value),
+            ).grid(row=index // 6, column=index % 6, padx=4, pady=4)
+        ctk.CTkButton(
+            self,
+            text="Altro colore...",
+            height=32,
+            font=font(11),
+            fg_color=COLORS.surface_alt,
+            hover_color=COLORS.surface_hover,
+            text_color=COLORS.text,
+            corner_radius=8,
+            command=self._custom,
+        ).pack(fill="x", padx=18, pady=(0, 18))
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.after(50, self._grab)
+
+    def _grab(self) -> None:
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _custom(self) -> None:
+        _rgb, value = colorchooser.askcolor(parent=self, title="Scegli un colore")
+        if value:
+            self._choose(value)
+
+    def _choose(self, color: str) -> None:
+        clean = normalize_hex(color)
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        if clean:
+            self._on_pick(clean)

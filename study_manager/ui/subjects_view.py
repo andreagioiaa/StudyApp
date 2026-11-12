@@ -567,6 +567,9 @@ class SubjectsView(ctk.CTkFrame):
         calendar_id = str(subject.get("google_calendar_id") or "")
         sync = getattr(self.app, "google_sync", None)
         info = sync.calendar_info(calendar_id) if (sync is not None and calendar_id) else None
+        feed = sync.ical.for_subject(str(subject.get("name") or "")) if sync is not None else None
+        if feed is not None and not calendar_id:
+            color = color or feed["color"]
         if color:
             ctk.CTkFrame(
                 frame, width=16, height=16, fg_color=color, corner_radius=8
@@ -576,6 +579,16 @@ class SubjectsView(ctk.CTkFrame):
             ctk.CTkLabel(
                 frame,
                 text=f"  Google Calendar · {name}  ",
+                font=font(10, "bold"),
+                fg_color=color or COLORS.surface_alt,
+                text_color=text_color_for(color) if color else COLORS.text,
+                corner_radius=8,
+                height=22,
+            ).pack(side="left")
+        elif feed is not None:
+            ctk.CTkLabel(
+                frame,
+                text=f"  Google Calendar (iCal) · {feed['name'] or feed['url_hint']}  ",
                 font=font(10, "bold"),
                 fg_color=color or COLORS.surface_alt,
                 text_color=text_color_for(color) if color else COLORS.text,

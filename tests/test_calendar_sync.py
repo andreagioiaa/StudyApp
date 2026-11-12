@@ -587,6 +587,156 @@ class ConcurrencyTests(CalendarSyncTestCase):
         self.assertTrue(self.service.wait_idle(10))
 
 
+def _ics(events: list[tuple[str, str, datetime]], name: str = "Sistemi Operativi") -> bytes:
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Google Inc//Google Calendar 70.9054//EN",
+             f"X-WR-CALNAME:{name}"]
+    for uid, title, start in events:
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"SUMMARY:{title}",
+            f"DTSTART:{start.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND:{(start + timedelta(hours=2)).strftime('%Y%m%dT%H%M%S')}",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
+class OfflineAuth(FakeAuth):
+    def is_connected(self) -> bool:
+        return False
+
+
+class ICalFeedTests(unittest.TestCase):
+    URL = "https://calendar.google.com/calendar/ical/so%40group.calendar.google.com/private-0123456789abcdef/basic.ics"
+
+    def setUp(self) -> None:
+        try:
+            import icalendar  # noqa: F401
+        except ImportError:  # pragma: no cover - dipendenza dell'app
+            self.skipTest("icalendar non installato")
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / "ical.db")
+        self.db.save_subject("Sistemi Operativi")
+        self.day = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        self.remote: dict[str, bytes] = {}
+        self.offline = False
+
+        def fetch(url: str) -> bytes:
+            if self.offline:
+                raise GoogleOfflineError("offline")
+            if url not in self.remote:
+                from study_manager.services.ical_feeds import ICalFeedError
+
+                raise ICalFeedError("Indirizzo non valido o reimpostato (errore 404).")
+            return self.remote[url]
+
+        self.service = CalendarSyncService(
+            self.db, auth=OfflineAuth(), client=FakeGoogle(), ical_fetch=fetch
+        )
+
+    def tearDown(self) -> None:
+        self.db.close_all()
+        self.temp.cleanup()
+
+    def _events(self) -> list[dict[str, Any]]:
+        rows = self.db._connection().execute(
+            "SELECT * FROM calendar_events ORDER BY start"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def test_feed_sync_subject_color_and_mirror_delete(self) -> None:
+        self.assertFalse(self.service.has_sources())
+        self.remote[self.URL] = _ics(
+            [("a@google.com", "Lezione 1", self.day), ("b@google.com", "Lezione 2", self.day + timedelta(days=1))]
+        )
+        feed_id = self.service.ical.add_feed(self.URL.replace("https://", "webcal://"), "Sistemi Operativi")
+        self.assertTrue(self.service.has_sources())
+        self.assertEqual(self.service.ical.url(feed_id), self.URL)
+
+        result = self.service.sync_now()
+        self.assertEqual(result["pulled"]["inserted"], 2)
+        events = self._events()
+        self.assertEqual({event["source"] for event in events}, {"ical_url"})
+        self.assertEqual({event["subject"] for event in events}, {"Sistemi Operativi"})
+        self.assertEqual({event["color_hex"] for event in events}, {"#4285F4"})
+        feed = self.service.ical.get(feed_id)
+        self.assertEqual(feed["name"], "Sistemi Operativi")  # da X-WR-CALNAME
+        self.assertEqual(self.db.get_subject("Sistemi Operativi")["color_hex"], "#4285F4")
+        self.assertTrue(self.service.source_label(events[0]["google_calendar_id"]).startswith("iCal"))
+
+        # Evento collegato a materiale e sessione, poi eliminato su Google.
+        gone = next(event for event in events if event["title"] == "Lezione 2")
+        material_id = self.db.add_material("Slide", "C:/s.pdf", "Sistemi Operativi", 2, gone["id"])
+        session_id = self.db.create_session("Sistemi Operativi", calendar_event_id=gone["id"])
+        self.remote[self.URL] = _ics([("a@google.com", "Lezione 1 (aula 2)", self.day)])
+        result = self.service.sync_now()
+        self.assertEqual(result["pulled"]["removed"], 1)
+        titles = [event["title"] for event in self._events()]
+        self.assertEqual(titles, ["Lezione 1 (aula 2)"])
+        self.assertIsNone(self.db.get_material(material_id)["calendar_event_id"])
+        self.assertIsNone(self.db.get_session(session_id)["calendar_event_id"])
+
+        # Nuovo colore dalla tavolozza: si applica a materia ed eventi.
+        self.service.ical.update_feed(feed_id, color="#0B8043")
+        self.service.sync_now()
+        self.assertEqual({event["color_hex"] for event in self._events()}, {"#0B8043"})
+
+        # Feed rimosso: i suoi eventi spariscono.
+        self.service.ical.remove_feed(feed_id)
+        self.assertEqual(self._events(), [])
+        self.assertFalse(self.service.has_sources())
+
+    def test_feed_errors_offline_and_local_events(self) -> None:
+        self.remote[self.URL] = _ics([("a@google.com", "Lezione", self.day)])
+        self.service.ical.add_feed(self.URL, "")
+        broken = self.service.ical.add_feed(self.URL.replace("0123", "9999"), "")
+        result = self.service.sync_now()
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("404", self.service.ical.get(broken)["error"])
+        event = self._events()[0]
+        self.assertEqual(event["subject"], "Lezione")  # fallback sul titolo, come l'import .ics
+
+        # Nuovo evento in StudyFlow: resta locale (nessuna API).
+        local_id = self.db.save_local_event(
+            None, "Ripasso", "Sistemi Operativi", self.day, self.day + timedelta(hours=1),
+            google_connected=False,
+        )
+        self.assertEqual(self.db.get_event(local_id)["source"], EVENT_SOURCE_MANUAL)
+        self.service.sync_now()
+        self.assertIsNotNone(self.db.get_event(local_id))
+
+        self.offline = True
+        with self.assertRaises(GoogleOfflineError):
+            self.service.sync_now()
+        self.assertEqual(len(self._events()), 2)  # niente cancellazioni da offline
+
+    def test_ics_file_import_unchanged(self) -> None:
+        from study_manager.services.ics_import import import_ics_file
+
+        path = Path(self.temp.name) / "export.ics"
+        path.write_bytes(_ics([("x@google.com", "Esame", self.day)]))
+        result = import_ics_file(self.db, path)
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(self._events()[0]["source"], "ics_file")
+        self.assertEqual(self._events()[0]["source_file"], "export.ics")
+
+    def test_feed_urls_encrypted_masked_and_not_in_backup(self) -> None:
+        self.service.ical.add_feed(self.URL, "Sistemi Operativi")
+        stored = self.db.get_setting("ical_feed_urls_enc")
+        self.assertNotIn("0123456789abcdef", stored)
+        self.assertNotIn("0123456789abcdef", self.db.get_setting("ical_feeds"))
+        self.assertNotIn("0123456789abcdef", mask_secrets(f"GET {self.URL}"))
+        root = Path(self.temp.name)
+        (root / "transcripts").mkdir()
+        result = export_backup(self.db, {"data": root, "transcripts": root / "transcripts"}, root / "b.zip")
+        with zipfile.ZipFile(result["path"]) as archive:
+            raw = archive.read("data.json").decode("utf-8")
+        self.assertNotIn("ical_feed_urls_enc", raw)
+        self.assertIn("ical_feeds", raw)
+
+
 class SecurityAndFormattingTests(unittest.TestCase):
     def test_secrets_masked_in_logs(self) -> None:
         secret_line = (

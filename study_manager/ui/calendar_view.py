@@ -16,12 +16,14 @@ from ..config import COLORS
 from ..database import (
     EVENT_PENDING_CREATE,
     EVENT_PENDING_UPDATE,
+    EVENT_SOURCE_ICAL,
     EVENT_SOURCE_ICS,
     normalize_hex,
 )
 from ..services.calendar_sync import format_elapsed, text_color_for
 from ..services.ics_import import import_ics_file
 from ..utils import day_bounds, parse_datetime, week_bounds
+from .calendar_help import open_calendar_help
 from .formatting import (
     format_day,
     format_day_short,
@@ -199,6 +201,20 @@ class CalendarView(ctk.CTkFrame):
 
         sync_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
         sync_frame.grid(row=1, column=2, sticky="e", padx=16, pady=(0, 9))
+        ctk.CTkButton(
+            sync_frame,
+            text="?  Come Connettere Calendario",
+            width=200,
+            height=30,
+            font=font(11),
+            fg_color="transparent",
+            hover_color=COLORS.surface_alt,
+            border_width=1,
+            border_color=COLORS.border,
+            text_color=COLORS.blue,
+            corner_radius=8,
+            command=self.open_help,
+        ).pack(side="left", padx=(0, 10))
         self.elapsed_label = ctk.CTkLabel(
             sync_frame,
             text="",
@@ -282,7 +298,20 @@ class CalendarView(ctk.CTkFrame):
                 ),
                 font=font(11),
                 text_color=COLORS.text_faint,
-            ).pack(anchor="w", padx=22, pady=(0, 24))
+            ).pack(anchor="w", padx=22, pady=(0, 12 if not self.sync.has_sources() else 24))
+            if not self.sync.has_sources():
+                ctk.CTkButton(
+                    empty,
+                    text="Come Connettere Calendario",
+                    width=210,
+                    height=34,
+                    font=font(11, "bold"),
+                    fg_color=COLORS.accent,
+                    hover_color=COLORS.accent_hover,
+                    text_color=COLORS.bg,
+                    corner_radius=8,
+                    command=self.open_help,
+                ).pack(anchor="w", padx=22, pady=(0, 22))
             return
 
         if self._mode == "week":
@@ -378,9 +407,9 @@ class CalendarView(ctk.CTkFrame):
         meta_parts = []
         if event.get("location"):
             meta_parts.append(str(event["location"]))
-        calendar = self.sync.calendar_info(event.get("google_calendar_id"))
-        if calendar is not None:
-            meta_parts.append(f"Google · {calendar.get('summary', '')}")
+        origin = self.sync.source_label(event.get("google_calendar_id"))
+        if origin:
+            meta_parts.append(origin)
         elif event.get("source") == EVENT_SOURCE_ICS:
             meta_parts.append("Importato da .ics")
         if meta_parts:
@@ -455,8 +484,8 @@ class CalendarView(ctk.CTkFrame):
     def _update_elapsed(self) -> None:
         if not self.winfo_exists():
             return
-        if not self.sync.is_connected():
-            self.elapsed_label.configure(text="Google Calendar non collegato", text_color=COLORS.text_faint)
+        if not self.sync.has_sources():
+            self.elapsed_label.configure(text="Nessun calendario collegato", text_color=COLORS.text_faint)
             return
         if self.sync.is_syncing:
             self.elapsed_label.configure(text="Sincronizzazione in corso...", text_color=COLORS.amber)
@@ -481,14 +510,9 @@ class CalendarView(ctk.CTkFrame):
         self._update_elapsed()
 
     def _sync_now(self) -> None:
-        if not self.sync.is_connected():
-            if messagebox.askyesno(
-                "Google Calendar non collegato",
-                "Per sincronizzare devi collegare il tuo account Google nelle "
-                "Impostazioni. Aprirle ora?",
-                parent=self.winfo_toplevel(),
-            ):
-                self.app.show_view("settings")
+        if not self.sync.has_sources():
+            # Nessun calendario collegato: mostra direttamente il tutorial.
+            self.open_help()
             return
         if self.sync.sync_async("manual"):
             self.status_label.configure(text="Sincronizzazione con Google in corso...", text_color=COLORS.amber)
@@ -502,15 +526,22 @@ class CalendarView(ctk.CTkFrame):
         if kind == "sync_finished":
             error = str(data.get("error") or "")
             result = data.get("result") or {}
+            warnings = list((result or {}).get("warnings") or [])
             if error:
-                self.status_label.configure(text=f"Google: {error}", text_color=COLORS.amber)
+                self.status_label.configure(text=f"Sincronizzazione: {error}", text_color=COLORS.amber)
+            elif warnings:
+                self.status_label.configure(
+                    text=f"Sincronizzato con avvisi: {warnings[0]}"
+                    + (f" (+{len(warnings) - 1})" if len(warnings) > 1 else ""),
+                    text_color=COLORS.amber,
+                )
             elif result:
                 pulled = result.get("pulled", {})
                 pushed = result.get("pushed", {})
                 sent = sum(int(pushed.get(key, 0)) for key in ("created", "updated", "deleted"))
                 self.status_label.configure(
                     text=(
-                        f"Google sincronizzato: {pulled.get('inserted', 0)} nuovi, "
+                        f"Calendari sincronizzati: {pulled.get('inserted', 0)} nuovi, "
                         f"{pulled.get('updated', 0)} aggiornati, {pulled.get('removed', 0)} rimossi, "
                         f"{sent} modifiche inviate."
                     ),
@@ -530,6 +561,9 @@ class CalendarView(ctk.CTkFrame):
                 pass
             self._elapsed_job = None
         super().destroy()
+
+    def open_help(self) -> None:
+        open_calendar_help(self, self.app, open_settings=lambda: self.app.show_view("settings"))
 
     # --------------------------------------------------------------- dialogo
     def open_event_dialog(self, event: dict[str, Any] | None) -> None:
@@ -686,6 +720,11 @@ class EventDialog(ctk.CTkToplevel):
     def _readonly_reason(self) -> str:
         if not self.event:
             return ""
+        if self.event.get("source") == EVENT_SOURCE_ICAL:
+            return (
+                "Evento letto da un indirizzo iCal (sola lettura): modificalo su Google "
+                "Calendar, StudyFlow lo aggiornera' alla prossima sincronizzazione."
+            )
         calendar_id = self.event.get("google_calendar_id")
         if calendar_id and not self.sync.is_calendar_writable(calendar_id):
             info = self.sync.calendar_info(calendar_id) or {}
@@ -934,7 +973,13 @@ class EventDialog(ctk.CTkToplevel):
             return
         subject = self._selected_subject()
         calendar_id, _color = self.db.get_subject_calendar(subject)
-        if calendar_id and self.sync.is_connected():
+        feed = self.sync.ical.for_subject(subject)
+        if feed is not None and not (calendar_id and self.sync.is_connected()):
+            text = (
+                "Solo in StudyFlow: il calendario Google della materia e' collegato "
+                "tramite indirizzo iCal (sola lettura)."
+            )
+        elif calendar_id and self.sync.is_connected():
             info = self.sync.calendar_info(calendar_id) or {}
             text = f"Calendario Google di destinazione: {info.get('summary', calendar_id)}"
             if not self.sync.is_calendar_writable(calendar_id):

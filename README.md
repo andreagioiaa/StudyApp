@@ -45,7 +45,9 @@ per l'elaborazione o la sincronizzazione dei dati.
 - Avvio di un Pomodoro direttamente da un evento, con durata proposta in base
   all'evento.
 - Svuotamento del calendario importato.
-- Sincronizzazione bidirezionale con Google Calendar (OAuth 2.0 PKCE): un
+- Calendari Google in sola lettura tramite **indirizzo segreto iCal**, senza
+  API ne' login (vedi sezione 8), con materia e colore per calendario.
+- In alternativa, sincronizzazione bidirezionale con Google Calendar (OAuth 2.0 PKCE): un
   calendario Google per materia, colori Google, sync automatica all'avvio e
   pulsante **Sincronizza Ora** con indicatore del tempo trascorso, creazione /
   modifica / eliminazione degli eventi da StudyFlow con coda offline.
@@ -451,7 +453,64 @@ L'importatore:
 Gli eventi possono essere aperti nella vista giornaliera o settimanale e avviati
 come sessione Pomodoro con **Studia ora**.
 
-### Google Calendar (sincronizzazione bidirezionale)
+### Google Calendar tramite indirizzo iCal (consigliato, senza API)
+
+> Lo stesso tutorial, passo per passo per entrambi i metodi, e' disponibile
+> nell'app con il pulsante **? Come Connettere Calendario** (nella vista
+> Calendario e nelle Impostazioni).
+
+E' il modo piu' semplice: nessun progetto Google Cloud, nessun login. Per ogni
+calendario Google (per esempio uno per materia) si copia il suo **indirizzo
+segreto in formato iCal** e lo si incolla in StudyFlow. Gli eventi vengono
+scaricati all'avvio e con **Calendario > Sincronizza Ora**.
+
+**Come trovare l'indirizzo segreto iCal di un calendario Google**
+
+1. Apri [Google Calendar](https://calendar.google.com) **dal computer** (l'app
+   per telefono non mostra questa impostazione) con l'account che possiede il
+   calendario.
+2. Nella colonna di sinistra, sotto **I miei calendari**, passa il mouse sul
+   calendario (es. "Sistemi Operativi") e clicca sui **tre puntini** ⋮.
+3. Scegli **Impostazioni e condivisione**.
+4. Scorri fino alla sezione **Integra calendario**.
+5. In **Indirizzo segreto in formato iCal** clicca sull'icona dell'occhio per
+   mostrarlo, poi sull'icona **Copia**. L'indirizzo ha questa forma:
+   `https://calendar.google.com/calendar/ical/<id-calendario>/private-<codice>/basic.ics`
+6. In StudyFlow apri **Impostazioni > Calendari tramite indirizzo iCal**,
+   incolla l'indirizzo, scegli la materia (facoltativo) e premi **Aggiungi**.
+7. Ripeti per ogni calendario. Clicca sul pallino colorato di un calendario
+   per sceglierne il colore (l'indirizzo iCal non contiene i colori di Google).
+
+Note:
+
+- **Non usare** l'"Indirizzo pubblico in formato iCal": funziona solo se il
+  calendario e' pubblico, cioe' visibile a chiunque.
+- L'indirizzo segreto e' come una password: chi lo conosce vede tutti gli
+  eventi. StudyFlow lo cifra con Windows (DPAPI), non lo scrive nei log e non
+  lo include nel backup ZIP (dopo un ripristino su un altro PC va reincollato).
+  Se pensi che sia stato diffuso, nella stessa sezione di Google Calendar usa
+  **Reimposta**: il vecchio indirizzo smette di funzionare e in StudyFlow
+  comparira' un errore finche' non aggiungi quello nuovo.
+- Per un calendario condiviso con te da un'altra persona l'indirizzo segreto
+  potrebbe non essere disponibile: puo' copiarlo e mandartelo il proprietario.
+- Va bene anche qualsiasi altro indirizzo `.ics`/`webcal://` (Outlook, orari
+  universitari...).
+
+Comportamento:
+
+- **Sola lettura**: gli eventi letti da iCal non si modificano in StudyFlow;
+  quelli creati con **+ Nuovo Evento** restano solo in StudyFlow.
+- **Materia e colore**: un calendario abbinato a una materia assegna quella
+  materia e il suo colore a tutti gli eventi; senza materia vale il fallback
+  dell'import `.ics` (categorie, poi titolo dell'evento).
+- **Cancellazione speculare**: un evento eliminato su Google sparisce da
+  StudyFlow alla sincronizzazione successiva; sessioni e materiali collegati
+  restano (viene solo azzerato il collegamento all'evento). Rimuovendo un
+  indirizzo dalle Impostazioni spariscono i suoi eventi.
+- Google aggiorna il file iCal con un certo ritardo: una modifica appena fatta
+  su Google puo' comparire in StudyFlow solo dopo un po'.
+
+### Google Calendar tramite API (avanzato, sincronizzazione bidirezionale)
 
 **Configurazione (una sola volta)**
 

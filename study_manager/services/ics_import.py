@@ -56,14 +56,36 @@ def _parse_categories(value: Any) -> str:
 
 def parse_ics(path: str | Path, horizon_days: int = 365) -> tuple[list[dict[str, Any]], list[str]]:
     """Legge un file ICS e restituisce eventi normalizzati e warning."""
-    from icalendar import Calendar
-
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"File ICS non trovato: {file_path}")
     if file_path.stat().st_size > _MAX_FILE_BYTES:
         raise ValueError("Il file ICS supera il limite di 20 MB.")
-    calendar = Calendar.from_ical(file_path.read_bytes())
+    return parse_ics_bytes(file_path.read_bytes(), file_path.name, horizon_days)
+
+
+def calendar_name(data: bytes) -> str:
+    """Nome del calendario (``X-WR-CALNAME``) se presente nel contenuto ICS."""
+    from icalendar import Calendar
+
+    try:
+        calendar = Calendar.from_ical(data)
+    except Exception:
+        return ""
+    return str(calendar.get("x-wr-calname") or "").strip()[:150]
+
+
+def parse_ics_bytes(
+    data: bytes,
+    label: str = "calendario",
+    horizon_days: int = 365,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Come :func:`parse_ics`, ma da contenuto gia' in memoria (es. URL iCal)."""
+    from icalendar import Calendar
+
+    if len(data) > _MAX_FILE_BYTES:
+        raise ValueError("Il calendario ICS supera il limite di 20 MB.")
+    calendar = Calendar.from_ical(data)
     now = datetime.now()
     import_start = now - timedelta(days=180)
     recurrence_start = now - timedelta(days=31)
@@ -171,7 +193,7 @@ def parse_ics(path: str | Path, horizon_days: int = 365) -> tuple[list[dict[str,
     deduped: dict[tuple[str, str], dict[str, Any]] = {}
     for event in events:
         deduped[(event["uid"], event["start"])] = event
-    LOGGER.info("ICS '%s': %d eventi importabili.", file_path.name, len(deduped))
+    LOGGER.info("ICS '%s': %d eventi importabili.", label, len(deduped))
     return list(deduped.values()), warnings
 
 

@@ -32,6 +32,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "google_sync_future_days": "365",
     "google_auto_create_calendar": "0",
     "google_enabled_calendars": "[]",
+    "ical_feeds": "[]",
 }
 
 # Impostazioni con segreti OAuth: cifrate con DPAPI, mai esportate nel backup
@@ -47,6 +48,9 @@ GOOGLE_ACCOUNT_SETTINGS: tuple[str, ...] = GOOGLE_SECRET_SETTINGS + (
     "google_client_id",
     "google_token_expiry",
     "google_account_email",
+    # Gli indirizzi iCal segreti danno accesso in lettura al calendario: sono
+    # cifrati come i token e non finiscono nel backup.
+    "ical_feed_urls_enc",
 )
 
 DEFAULT_BLOCKED_SITES: tuple[str, ...] = (

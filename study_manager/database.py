@@ -36,6 +36,9 @@ SCHEMA_VERSION = 7
 EVENT_SOURCE_MANUAL = "manual"
 EVENT_SOURCE_ICS = "ics_file"
 EVENT_SOURCE_GOOGLE = "google_api"
+# Eventi letti da un indirizzo iCal (es. "Indirizzo segreto in formato iCal" di
+# Google Calendar): sola lettura, aggiornati a ogni sincronizzazione.
+EVENT_SOURCE_ICAL = "ical_url"
 EVENT_PENDING_CREATE = "google_pending_create"
 EVENT_PENDING_UPDATE = "google_pending_update"
 EVENT_PENDING_DELETE = "google_pending_delete"
@@ -43,6 +46,7 @@ EVENT_SOURCES: tuple[str, ...] = (
     EVENT_SOURCE_MANUAL,
     EVENT_SOURCE_ICS,
     EVENT_SOURCE_GOOGLE,
+    EVENT_SOURCE_ICAL,
     EVENT_PENDING_CREATE,
     EVENT_PENDING_UPDATE,
     EVENT_PENDING_DELETE,
@@ -1847,6 +1851,28 @@ class Database:
             (now_str(), str(google_calendar_id)),
         )
 
+    def set_subject_color(self, subject: str, color_hex: str | None) -> None:
+        """Colore della materia (crea la riga in ``subjects`` se e' solo un'etichetta)."""
+        clean = str(subject or "").strip()[:150]
+        color = normalize_hex(color_hex)
+        if not clean or color is None:
+            return
+        timestamp = now_str()
+        connection = self._connection()
+        existing = connection.execute(
+            "SELECT id FROM subjects WHERE LOWER(name) = LOWER(?)", (clean,)
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO subjects(name, created_at, updated_at, color_hex) VALUES (?, ?, ?, ?)",
+                (clean, timestamp, timestamp, color),
+            )
+        else:
+            connection.execute(
+                "UPDATE subjects SET color_hex = ?, updated_at = ? WHERE id = ?",
+                (color, timestamp, int(existing["id"])),
+            )
+
     def set_calendar_color(self, google_calendar_id: str, color_hex: str | None) -> None:
         """Aggiorna il colore della materia collegata al calendario indicato."""
         color = normalize_hex(color_hex)
@@ -2167,6 +2193,8 @@ class Database:
         self,
         google_calendar_id: str,
         events: Iterable[dict[str, Any]],
+        source: str = EVENT_SOURCE_GOOGLE,
+        source_file: str = "Google Calendar",
     ) -> dict[str, int]:
         """Inserisce o aggiorna gli eventi scaricati da un calendario Google.
 
@@ -2225,7 +2253,7 @@ class Database:
                         "end = ?, location = ?, description = ?, all_day = ?, "
                         "color_hex = ?, color_id = ?, imported_at = ?, source = ?, "
                         "sync_error = '' WHERE id = ?",
-                        (*values, EVENT_SOURCE_GOOGLE, int(existing["id"])),
+                        (*values, source, int(existing["id"])),
                     )
                     updated += 1
                 else:
@@ -2233,11 +2261,12 @@ class Database:
                         "INSERT INTO calendar_events(title, subject, start, end, location, "
                         "description, all_day, color_hex, color_id, imported_at, uid, "
                         "source_file, source, google_event_id, google_calendar_id) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Google Calendar', ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             *values,
                             google_uid(calendar_id, google_event_id),
-                            EVENT_SOURCE_GOOGLE,
+                            str(source_file or "")[:500],
+                            source,
                             google_event_id,
                             calendar_id,
                         ),
@@ -2255,6 +2284,7 @@ class Database:
         window_start: str,
         window_end: str,
         remote_event_ids: Iterable[str],
+        source: str = EVENT_SOURCE_GOOGLE,
     ) -> int:
         """Rimuove gli eventi ``google_api`` spariti da Google nella finestra attiva.
 
@@ -2268,7 +2298,7 @@ class Database:
             rows = connection.execute(
                 "SELECT id, google_event_id FROM calendar_events "
                 "WHERE source = ? AND google_calendar_id = ? AND end > ? AND start < ?",
-                (EVENT_SOURCE_GOOGLE, str(google_calendar_id), window_start, window_end),
+                (source, str(google_calendar_id), window_start, window_end),
             ).fetchall()
             stale = [
                 int(row["id"])
@@ -2282,14 +2312,18 @@ class Database:
             raise
         return removed
 
-    def purge_unsynced_calendars(self, enabled_calendar_ids: Iterable[str]) -> int:
-        """Rimuove gli eventi ``google_api`` dei calendari non piu' sincronizzati."""
+    def purge_unsynced_calendars(
+        self,
+        enabled_calendar_ids: Iterable[str],
+        source: str = EVENT_SOURCE_GOOGLE,
+    ) -> int:
+        """Rimuove gli eventi (di ``source``) dei calendari non piu' sincronizzati."""
         enabled = [str(value) for value in enabled_calendar_ids]
         connection = self._connection()
         connection.execute("BEGIN IMMEDIATE")
         try:
             sql = "SELECT id FROM calendar_events WHERE source = ?"
-            params: list[Any] = [EVENT_SOURCE_GOOGLE]
+            params: list[Any] = [source]
             if enabled:
                 sql += f" AND google_calendar_id NOT IN ({', '.join('?' for _ in enabled)})"
                 params.extend(enabled)

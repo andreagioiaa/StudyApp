@@ -465,7 +465,7 @@ class StudyFlowApp(ctk.CTk):
         if self._closing:
             return
         try:
-            if self.google_sync.is_connected():
+            if self.google_sync.has_sources():
                 self.google_sync.sync_async("startup")
         except Exception:
             self.logger.exception("Avvio della sincronizzazione Google non riuscito.")

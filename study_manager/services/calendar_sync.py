@@ -36,6 +36,7 @@ from ..database import (
 )
 from ..logging_setup import mask_secrets
 from ..utils import LOCAL_DATETIME_FMT, parse_datetime, safe_int
+from .ical_feeds import ICalFeedStore, sync_ical_feeds
 from .google_auth import (
     HTTP_TIMEOUT,
     GoogleAuth,
@@ -360,10 +361,14 @@ class CalendarSyncService:
         db: Database,
         auth: GoogleAuth | None = None,
         client: Any | None = None,
+        ical_fetch: Callable[[str], bytes] | None = None,
     ):
         self.db = db
         self.auth = auth or GoogleAuth(db)
         self.client = client or GoogleCalendarClient(self.auth)
+        # Calendari in sola lettura tramite indirizzo iCal (nessuna API).
+        self.ical = ICalFeedStore(db)
+        self._ical_fetch = ical_fetch
         # Serializza sync e flush: mai due thread che parlano con Google insieme.
         self._lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -391,6 +396,21 @@ class CalendarSyncService:
             return self.auth.is_connected()
         except Exception:
             return False
+
+    def has_sources(self) -> bool:
+        """True se c'e' qualcosa da sincronizzare: account Google o indirizzi iCal."""
+        try:
+            return self.is_connected() or self.ical.has_feeds()
+        except Exception:
+            return False
+
+    def source_label(self, calendar_id: str | None) -> str:
+        """Nome del calendario di origine di un evento (Google o iCal)."""
+        feed = self.ical.for_calendar_id(calendar_id)
+        if feed is not None:
+            return f"iCal · {feed['name'] or feed['url_hint']}"
+        info = self.calendar_info(calendar_id)
+        return f"Google · {info.get('summary', '')}" if info else ""
 
     @property
     def is_syncing(self) -> bool:
@@ -658,13 +678,30 @@ class CalendarSyncService:
 
     # ------------------------------------------------------------ orchestr.
     def sync_now(self) -> dict[str, Any]:
-        """Sincronizzazione completa e bloccante: da chiamare fuori dal main thread."""
-        if not self.is_connected():
-            raise GoogleAuthRequired("Account Google non collegato.")
+        """Sincronizzazione completa e bloccante: da chiamare fuori dal main thread.
+
+        Con l'account Google collegato: calendari, flush della coda e pull via
+        API. Con indirizzi iCal configurati: download e aggiornamento dei feed
+        (sola lettura). Le due modalita' possono convivere.
+        """
+        connected = self.is_connected()
+        if not connected and not self.ical.has_feeds():
+            raise GoogleAuthRequired(
+                "Nessun calendario configurato: aggiungi un indirizzo iCal nelle Impostazioni."
+            )
+        pushed = {"created": 0, "updated": 0, "deleted": 0, "failed": 0}
+        pulled = {"inserted": 0, "updated": 0, "skipped": 0, "removed": 0, "calendars": 0}
+        ical: dict[str, Any] = {"inserted": 0, "updated": 0, "removed": 0, "feeds": 0, "errors": []}
         with self._lock:
-            self.refresh_calendars()
-            pushed = self.flush_queue()
-            pulled = self.pull()
+            if connected:
+                self.refresh_calendars()
+                pushed = self.flush_queue()
+                pulled = self.pull()
+            if self.ical.list_feeds() or connected:
+                _past, future = self.window_days()
+                ical = sync_ical_feeds(self.db, self.ical, future, fetch=self._ical_fetch)
+            for key in ("inserted", "updated", "removed"):
+                pulled[key] += int(ical.get(key, 0))
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.db.set_setting(SETTING_LAST_SYNC, stamp)
         self.offline = False
@@ -676,7 +713,13 @@ class CalendarSyncService:
             pulled["updated"],
             pulled["removed"],
         )
-        return {"pushed": pushed, "pulled": pulled, "last_sync_at": stamp}
+        return {
+            "pushed": pushed,
+            "pulled": pulled,
+            "ical": ical,
+            "warnings": list(ical.get("errors", [])),
+            "last_sync_at": stamp,
+        }
 
     def sync_async(self, reason: str = "manual") -> bool:
         """Avvia la sincronizzazione in un thread daemon. ``False`` se gia' in corso."""

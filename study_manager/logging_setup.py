@@ -17,6 +17,7 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"ya29\.[0-9A-Za-z_\-\.]+"), "ya29.***"),  # access token
     (re.compile(r"1//[0-9A-Za-z_\-]{10,}"), "1//***"),  # refresh token
     (re.compile(r"GOCSPX-[0-9A-Za-z_\-]+"), "GOCSPX-***"),  # client secret
+    (re.compile(r"private-[0-9A-Za-z]+"), "private-***"),  # indirizzo segreto iCal
     (re.compile(r"(?i)(Bearer\s+)[^\s\"',}]+"), r"\1***"),
     (
         re.compile(
