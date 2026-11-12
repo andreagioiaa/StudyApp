@@ -11,6 +11,7 @@ Tutta l'elaborazione pesante gira in un thread separato
 from __future__ import annotations
 
 import logging
+import time
 import tkinter as tk
 import webbrowser
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ import customtkinter as ctk
 
 from ..config import COLORS
 from ..services.pdf_tools.controller import PdfConversionController, list_pdfs
+from ..services.pdf_tools.draft import default_draft_path, load_draft, save_draft
+from ..services.pdf_tools.draft import delete_draft as delete_draft_file
 from ..services.pdf_tools.document import (
     BLOCK_BULLET,
     BLOCK_HEADING,
@@ -114,6 +117,7 @@ SETTING_DEFAULTS = {
 
 PREVIEW_RENDER_CHUNK = 18
 EDIT_DEBOUNCE_MS = 380
+DRAFT_DEBOUNCE_MS = 1500
 
 
 @dataclass
@@ -153,6 +157,13 @@ class PdfView(ctk.CTkFrame):
         self._renderer: MathRenderer | None = None
         self._preview_images: list[tk.PhotoImage] = []
         self._remove_dialog: RemoveTextDialog | None = None
+        self._draft_job: str | None = None
+        self._draft_saved_at = 0.0
+        try:
+            self._draft_path = default_draft_path()
+        except Exception:
+            LOGGER.exception("Cartella della bozza PDF non disponibile.")
+            self._draft_path = None
 
         settings = self._load_settings()
         self._build_vars(settings)
@@ -170,6 +181,7 @@ class PdfView(ctk.CTkFrame):
         self._refresh_backends()
         self._update_buttons()
         self._show_placeholder()
+        self._restore_draft()
 
     # ------------------------------------------------------------------ settings
     def _load_settings(self) -> dict[str, str]:
@@ -423,7 +435,7 @@ class PdfView(ctk.CTkFrame):
 
         self._small_label(export, "Esporta tutti i documenti estratti").pack(anchor="w", padx=16, pady=(10, 4))
         batch = ctk.CTkFrame(export, fg_color="transparent")
-        batch.pack(fill="x", padx=16, pady=(0, 16))
+        batch.pack(fill="x", padx=16, pady=(0, 6))
         batch.grid_columnconfigure(1, weight=1)
         ctk.CTkOptionMenu(
             batch, values=list(BATCH_FORMAT_CHOICES), variable=self.batch_format_var, width=86,
@@ -431,6 +443,21 @@ class PdfView(ctk.CTkFrame):
         ).grid(row=0, column=0, sticky="w")
         self.batch_button = self._button(batch, "Esporta tutti…", self.export_all)
         self.batch_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        separator(export).pack(fill="x", padx=16, pady=(10, 8))
+        self._small_label(export, "Salvataggio temporaneo").pack(anchor="w", padx=16, pady=(0, 2))
+        self.draft_label = ctk.CTkLabel(
+            export, text="Nessuna bozza salvata.", font=font(10), text_color=COLORS.text_faint,
+            anchor="w", justify="left", wraplength=270,
+        )
+        self.draft_label.pack(fill="x", padx=16, pady=(0, 6))
+        draft = ctk.CTkFrame(export, fg_color="transparent")
+        draft.pack(fill="x", padx=16, pady=(0, 16))
+        draft.grid_columnconfigure((0, 1), weight=1)
+        self.draft_save_button = self._button(draft, "Salva ora", lambda: self._save_draft(notify=True))
+        self.draft_save_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.draft_delete_button = self._button(draft, "Elimina", self.delete_draft, danger=True)
+        self.draft_delete_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
     # ------------------------------------------------------------------ layout: area di lavoro
     def _build_workspace(self) -> None:
@@ -788,6 +815,7 @@ class PdfView(ctk.CTkFrame):
             self._refresh_doc_menu()
             if self.current < 0:
                 self._select_doc(len(self.docs) - 1)
+            self._schedule_draft_save()
         elif kind == "file_error":
             path = Path(event["path"])
             self.docs.append(DocState(path=path, title=path.stem, source="", error=str(event.get("error", ""))))
@@ -809,6 +837,7 @@ class PdfView(ctk.CTkFrame):
                 message = f"Completato: {converted} PDF, {pages} slide/pagine."
             self._set_status(message)
             self._task_label = ""
+            self._save_draft()
             self._update_buttons()
             if converted and not event.get("cancelled"):
                 self.app.toast(message)
@@ -839,6 +868,10 @@ class PdfView(ctk.CTkFrame):
         if not katex_available():
             self.katex_button.configure(state="disabled")
         self.batch_button.configure(state="normal" if has_any and not busy else "disabled")
+        if hasattr(self, "draft_delete_button"):
+            has_draft = bool(self.docs) or self._draft_exists()
+            self.draft_save_button.configure(state="normal" if has_any and not busy else "disabled")
+            self.draft_delete_button.configure(state="normal" if has_draft and not busy else "disabled")
 
     # ------------------------------------------------------------------ documenti
     def _doc_label(self, index: int) -> str:
@@ -883,6 +916,7 @@ class PdfView(ctk.CTkFrame):
         )
         self.schedule_render(immediate=True)
         self._update_buttons()
+        self._schedule_draft_save()
         if self._remove_dialog is not None and self._remove_dialog.winfo_exists():
             self._remove_dialog.after(10, self._remove_dialog._refresh_count)
 
@@ -927,6 +961,7 @@ class PdfView(ctk.CTkFrame):
         self._commit_editor()
         self.schedule_render()
         self._update_buttons()
+        self._schedule_draft_save()
 
     def _commit_editor(self) -> None:
         doc = self._current_doc()
@@ -959,6 +994,7 @@ class PdfView(ctk.CTkFrame):
         self._update_editor_title()
         self._set_editor_text(doc.source)
         self.schedule_render(immediate=True)
+        self._schedule_draft_save()
 
     # ------------------------------------------------------------------ anteprima
     def schedule_render(self, immediate: bool = False) -> None:
@@ -1140,6 +1176,7 @@ class PdfView(ctk.CTkFrame):
             self.schedule_render(immediate=True)
             self._update_buttons()
             self._set_status(f"Rimosse {removed} occorrenze di testo.")
+            self._schedule_draft_save()
         return snapshot, removed, touched
 
     def restore_sources(self, snapshot: list[tuple[int, str]]) -> None:
@@ -1152,6 +1189,7 @@ class PdfView(ctk.CTkFrame):
         self.schedule_render(immediate=True)
         self._update_buttons()
         self._set_status("Rimozione annullata.")
+        self._schedule_draft_save()
 
     def _replace_editor_text(self, text: str) -> None:
         """Sostituisce il contenuto dell'editor come un'unica modifica annullabile."""
@@ -1326,6 +1364,168 @@ class PdfView(ctk.CTkFrame):
         self._update_buttons()
         self._start_polling()
 
+    # ------------------------------------------------------------------ salvataggio temporaneo
+    def _draft_exists(self) -> bool:
+        return self._draft_path is not None and self._draft_path.is_file()
+
+    def _is_extracting(self) -> bool:
+        return self.controller.is_running() and self._task_label == "extract"
+
+    def _schedule_draft_save(self) -> None:
+        if self._draft_path is None:
+            return
+        if self._draft_job is not None:
+            try:
+                self.after_cancel(self._draft_job)
+            except (tk.TclError, ValueError):
+                pass
+        self._draft_job = self.after(DRAFT_DEBOUNCE_MS, self._save_draft)
+
+    def _cancel_draft_job(self) -> None:
+        if self._draft_job is not None:
+            try:
+                self.after_cancel(self._draft_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._draft_job = None
+
+    def _save_draft(self, force: bool = False, notify: bool = False) -> None:
+        """Scrive la bozza su disco (o la rimuove se non c'e' piu' nulla da salvare).
+
+        Durante un'estrazione non si salva: la bozza precedente resta intatta
+        finche' la nuova estrazione non e' terminata (o l'app viene chiusa).
+        """
+        self._cancel_draft_job()
+        if self._draft_path is None:
+            return
+        if self._is_extracting() and not force:
+            return
+        self._commit_editor()
+        if not self.docs:
+            # Nessun documento: niente da salvare. Una bozza gia' presente resta
+            # su disco finche' non si preme «Elimina».
+            return
+        payload = [
+            {
+                "path": str(doc.path),
+                "title": doc.title,
+                "source": doc.source,
+                "fmt": doc.fmt,
+                "warnings": list(doc.warnings),
+                "engines": dict(doc.engines),
+                "error": doc.error,
+            }
+            for doc in self.docs
+        ]
+        try:
+            self._draft_saved_at = save_draft(
+                self._draft_path, payload, self.current, [str(path) for path in self.sources]
+            )
+        except Exception as exc:
+            LOGGER.exception("Salvataggio bozza PDF non riuscito.")
+            if notify:
+                messagebox.showerror("PDF e Slide", f"Salvataggio della bozza non riuscito:\n{exc}", parent=self)
+            return
+        self._update_draft_label()
+        self._update_buttons()
+        if notify:
+            self.app.toast("Bozza salvata")
+
+    def _update_draft_label(self) -> None:
+        if not hasattr(self, "draft_label"):
+            return
+        if not self._draft_saved_at or not self._draft_exists():
+            self.draft_label.configure(
+                text="Nessuna bozza salvata. Le modifiche vengono salvate in automatico.",
+                text_color=COLORS.text_faint,
+            )
+            return
+        stamp = time.localtime(self._draft_saved_at)
+        if time.strftime("%Y-%m-%d", stamp) == time.strftime("%Y-%m-%d"):
+            when = time.strftime("alle %H:%M", stamp)
+        else:
+            when = time.strftime("il %d/%m alle %H:%M", stamp)
+        count = len(self.docs)
+        docs = "1 documento" if count == 1 else f"{count} documenti"
+        self.draft_label.configure(
+            text=f"Bozza salvata {when} ({docs}). Resta disponibile anche dopo la chiusura dell'app.",
+            text_color=COLORS.text_muted,
+        )
+
+    def _restore_draft(self) -> None:
+        if self._draft_path is None:
+            self._update_draft_label()
+            return
+        try:
+            data = load_draft(self._draft_path)
+        except Exception:
+            LOGGER.exception("Lettura bozza PDF non riuscita.")
+            data = None
+        if not data:
+            self._update_draft_label()
+            return
+        self.docs = [
+            DocState(
+                path=Path(raw["path"]),
+                title=raw["title"],
+                source=raw["source"],
+                fmt=SOURCE_LATEX if raw["fmt"] == SOURCE_LATEX else SOURCE_MARKDOWN,
+                warnings=list(raw["warnings"]),
+                engines=dict(raw["engines"]),
+                error=raw["error"],
+            )
+            for raw in data["docs"]
+        ]
+        self.sources = [Path(item) for item in data["sources"] if Path(item).is_file()]
+        self._draft_saved_at = float(data.get("saved_at") or 0.0)
+        self.current = -1
+        self._update_source_label()
+        self._refresh_doc_menu()
+        self._select_doc(int(data["current"]))
+        self._cancel_draft_job()
+        self._update_draft_label()
+        self._set_status("Bozza ripristinata: puoi continuare da dove eri rimasto.")
+
+    def delete_draft(self) -> None:
+        if self.controller.is_running():
+            return
+        if not messagebox.askyesno(
+            "PDF e Slide",
+            "Eliminare la bozza salvata?\n\nIl testo estratto e tutte le modifiche manuali verranno "
+            "rimossi dall'editor. I file gia' esportati non vengono toccati.",
+            icon="warning",
+            parent=self,
+        ):
+            return
+        self._cancel_draft_job()
+        if self._edit_job is not None:
+            try:
+                self.after_cancel(self._edit_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._edit_job = None
+        try:
+            if self._draft_path is not None:
+                delete_draft_file(self._draft_path)
+        except Exception as exc:
+            LOGGER.exception("Eliminazione bozza PDF non riuscita.")
+            messagebox.showerror("PDF e Slide", f"Eliminazione della bozza non riuscita:\n{exc}", parent=self)
+            return
+        self._draft_saved_at = 0.0
+        self.docs = []
+        self.current = -1
+        self._set_editor_text("")
+        self.source_mode_var.set(SOURCE_MODES[0])
+        self._update_editor_title()
+        self.info_label.configure(text="")
+        self._refresh_doc_menu()
+        self._show_placeholder()
+        self.progress.set(0)
+        self._set_status("Bozza eliminata.")
+        self._update_draft_label()
+        self._update_buttons()
+        self.app.toast("Bozza eliminata")
+
     # ------------------------------------------------------------------ ciclo di vita
     def on_show(self) -> None:
         self._update_buttons()
@@ -1337,8 +1537,16 @@ class PdfView(ctk.CTkFrame):
             self._remove_dialog.close()
         self._commit_editor()
         self._save_settings()
+        self._save_draft()
 
     def shutdown(self) -> None:
+        try:
+            self._commit_editor()
+            # Se l'app si chiude durante un'estrazione si salva quanto gia' arrivato.
+            if self.docs:
+                self._save_draft(force=True)
+        except Exception:
+            LOGGER.exception("Salvataggio bozza PDF in chiusura non riuscito.")
         try:
             self.controller.shutdown()
         except Exception:

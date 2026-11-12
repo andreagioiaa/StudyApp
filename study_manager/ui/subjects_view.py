@@ -32,6 +32,8 @@ from .widgets import (
 )
 
 
+LAST_SUBJECT_SETTING = "subjects_last_selected"
+
 COUNTDOWN_COLORS = {
     "undefined": COLORS.text_muted,
     "upcoming": COLORS.accent,
@@ -45,7 +47,7 @@ class SubjectsView(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent")
         self.app = app
         self.db = app.db
-        self._selected: str | None = None
+        self._selected: str | None = self._load_last_selection()
         self._search_job: str | None = None
         self._countdown_job: str | None = None
         self._countdown_label: ctk.CTkLabel | None = None
@@ -81,16 +83,67 @@ class SubjectsView(ctk.CTkFrame):
     def _build_body(self) -> None:
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.grid(row=1, column=0, sticky="nsew")
-        body.grid_columnconfigure(0, weight=0, minsize=268)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(1, weight=1)
 
-        left = Card(body)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        left.grid_columnconfigure(0, weight=1)
-        left.grid_rowconfigure(1, weight=1)
+        # Barra di selezione compatta: il menu a tendina sostituisce la
+        # vecchia colonna con l'elenco completo, lasciando tutta la
+        # larghezza alla pagina della materia.
+        bar = Card(body)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        bar.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(
+            bar,
+            text="MATERIA",
+            font=font(9, "bold"),
+            text_color=COLORS.text_faint,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(18, 10), pady=12)
+        self.subject_combo = ctk.CTkComboBox(
+            bar,
+            values=[""],
+            width=320,
+            height=36,
+            state="readonly",
+            fg_color=COLORS.surface_alt,
+            border_color=COLORS.border,
+            button_color=COLORS.surface_hover,
+            button_hover_color=COLORS.border,
+            dropdown_fg_color=COLORS.surface,
+            dropdown_hover_color=COLORS.surface_hover,
+            text_color=COLORS.text,
+            font=font(12, "bold"),
+            dropdown_font=font(11),
+            corner_radius=9,
+            command=self._on_combo,
+        )
+        self.subject_combo.grid(row=0, column=1, sticky="w", pady=12)
+
+        info = ctk.CTkFrame(bar, fg_color="transparent")
+        info.grid(row=0, column=2, sticky="w", padx=(14, 10))
+        self.subject_meta = ctk.CTkLabel(
+            info,
+            text="",
+            font=font(10),
+            text_color=COLORS.text_faint,
+            anchor="w",
+        )
+        self.subject_meta.pack(side="left")
+        self.subject_badge = ctk.CTkLabel(
+            info,
+            text="",
+            font=font(9, "bold"),
+            text_color=COLORS.text_muted,
+            fg_color=COLORS.surface_alt,
+            corner_radius=6,
+            padx=7,
+            height=20,
+        )
+        self.subject_badge.pack(side="left", padx=(10, 0))
+
         self.search_entry = ctk.CTkEntry(
-            left,
+            bar,
+            width=240,
             height=36,
             placeholder_text="Cerca materia, docente o email...",
             fg_color=COLORS.surface_alt,
@@ -99,29 +152,17 @@ class SubjectsView(ctk.CTkFrame):
             font=font(11),
             corner_radius=9,
         )
-        self.search_entry.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 10))
+        self.search_entry.grid(row=0, column=3, sticky="e", padx=(0, 14), pady=12)
         self.search_entry.bind("<KeyRelease>", self._on_search)
+        self._combo_map: dict[str, str] = {}
 
-        self.list_scroll = ctk.CTkScrollableFrame(
-            left,
-            fg_color="transparent",
-            scrollbar_button_color=COLORS.border,
-            scrollbar_button_hover_color=COLORS.surface_hover,
-        )
-        self.list_scroll.grid(row=1, column=0, sticky="nsew", padx=(8, 2), pady=(0, 8))
-        self.list_scroll.grid_columnconfigure(0, weight=1)
-
-        right = ctk.CTkFrame(body, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew")
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(0, weight=1)
         self.detail_scroll = ctk.CTkScrollableFrame(
-            right,
+            body,
             fg_color="transparent",
             scrollbar_button_color=COLORS.border,
             scrollbar_button_hover_color=COLORS.surface_hover,
         )
-        self.detail_scroll.grid(row=0, column=0, sticky="nsew")
+        self.detail_scroll.grid(row=1, column=0, sticky="nsew")
         self.detail_scroll.grid_columnconfigure(0, weight=1)
 
     # ------------------------------------------------------------------ data
@@ -193,62 +234,73 @@ class SubjectsView(ctk.CTkFrame):
 
     def _select(self, name: str) -> None:
         self._selected = name
+        self._remember_selection(name)
         self.refresh()
 
-    # ------------------------------------------------------------------ list
+    def _on_combo(self, label: str) -> None:
+        name = self._combo_map.get(label)
+        if name is not None:
+            self._select(name)
+
+    def _load_last_selection(self) -> str | None:
+        try:
+            value = self.db.get_setting(LAST_SUBJECT_SETTING, "")
+        except Exception:
+            return None
+        return value or None
+
+    def _remember_selection(self, name: str) -> None:
+        try:
+            self.db.set_setting(LAST_SUBJECT_SETTING, name)
+        except Exception:
+            self.app.logger.debug("Impossibile salvare l'ultima materia aperta.", exc_info=True)
+
+    # ------------------------------------------------------------- dropdown
+    @staticmethod
+    def _combo_label(subject: dict[str, Any]) -> str:
+        name = str(subject.get("name") or "")
+        display_name = str(subject.get("display_name") or name) or "Senza nome"
+        if subject.get("orphan"):
+            count = int(subject.get("materials", 0) or 0)
+            return f"⚠  {display_name} ({count})"
+        return display_name
+
     def _render_list(self, subjects: list[dict[str, Any]]) -> None:
         if not render_state(self).should_render("list", subjects, self._selected):
             return
-        clear_children(self.list_scroll)
+        self._combo_map = {}
         if not subjects:
-            empty = ctk.CTkFrame(self.list_scroll, fg_color="transparent")
-            empty.grid(row=0, column=0, sticky="ew", padx=12, pady=22)
-            ctk.CTkLabel(
-                empty,
-                text="Nessuna materia trovata.",
-                font=font(12, "bold"),
-                text_color=COLORS.text_muted,
-                anchor="w",
-            ).pack(anchor="w")
-            ctk.CTkLabel(
-                empty,
-                text="Crea una materia oppure cambia la ricerca.",
-                font=font(10),
-                text_color=COLORS.text_faint,
-                anchor="w",
-                wraplength=210,
-                justify="left",
-            ).pack(anchor="w", pady=(4, 0))
+            placeholder = "Nessuna materia trovata"
+            self.subject_combo.configure(values=[placeholder])
+            self.subject_combo.set(placeholder)
+            self.subject_combo.configure(state="disabled")
+            self.subject_meta.configure(text="Crea una materia oppure cambia la ricerca.")
+            self.subject_badge.pack_forget()
             return
-        for index, subject in enumerate(subjects):
-            self._subject_row(subject, index)
 
-    def _subject_row(self, subject: dict[str, Any], row: int) -> None:
-        name = str(subject.get("name") or "")
-        display_name = str(subject.get("display_name") or name)
+        labels: list[str] = []
+        selected_label = ""
+        selected_subject: dict[str, Any] | None = None
+        for subject in subjects:
+            name = str(subject.get("name") or "")
+            label = self._combo_label(subject)
+            # Etichette univoche anche nel caso (raro) di nomi visualizzati uguali.
+            base, suffix = label, 2
+            while label in self._combo_map:
+                label = f"{base} ({suffix})"
+                suffix += 1
+            self._combo_map[label] = name
+            labels.append(label)
+            if self._selected and name.casefold() == self._selected.casefold():
+                selected_label = label
+                selected_subject = subject
+
+        self.subject_combo.configure(state="readonly", values=labels)
+        self.subject_combo.set(selected_label or labels[0])
+        self._render_selection_info(selected_subject or subjects[0])
+
+    def _render_selection_info(self, subject: dict[str, Any]) -> None:
         is_orphan = bool(subject.get("orphan"))
-        selected = bool(self._selected) and name.casefold() == self._selected.casefold()
-        frame = ctk.CTkFrame(
-            self.list_scroll,
-            fg_color=COLORS.surface_alt if selected else COLORS.surface,
-            corner_radius=10,
-            border_width=1,
-            border_color=COLORS.accent if selected else COLORS.border,
-        )
-        frame.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
-        frame.grid_columnconfigure(0, weight=1)
-
-        title = ctk.CTkLabel(
-            frame,
-            text=display_name or "Senza nome",
-            font=font(12, "bold"),
-            text_color=COLORS.text,
-            anchor="w",
-            wraplength=190,
-            justify="left",
-        )
-        title.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 2))
-
         cfu = int(subject.get("cfu", 0) or 0)
         if is_orphan:
             count = int(subject.get("materials", 0) or 0)
@@ -257,41 +309,24 @@ class SubjectsView(ctk.CTkFrame):
             meta_text = f"{format_cfu(cfu)}  ·  {cfu_to_hours(cfu)} h"
         else:
             meta_text = "CFU e dettagli da impostare"
-        meta = ctk.CTkLabel(
-            frame,
-            text=meta_text,
-            font=font(9),
-            text_color=COLORS.text_faint,
-            anchor="w",
-        )
-        meta.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 9))
-
         countdown = exam_countdown(str(subject.get("exam_date") or ""))
-        badge = ctk.CTkLabel(
-            frame,
+        self.subject_meta.configure(text=meta_text)
+        self.subject_badge.configure(
             text=(
-                "Apri per assegnare una materia"
+                "Da assegnare a una materia"
                 if is_orphan
                 else f"Esame {countdown['date_label']}"
                 if countdown["defined"]
                 else "Data esame da definire"
             ),
-            font=font(9, "bold"),
             text_color=(
                 COLORS.amber
                 if is_orphan
                 else COUNTDOWN_COLORS.get(str(countdown["status"]), COLORS.text_muted)
             ),
-            fg_color=COLORS.surface,
-            corner_radius=6,
-            padx=7,
-            height=20,
-            anchor="w",
         )
-        badge.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
-
-        for widget in (frame, title, meta, badge):
-            widget.bind("<Button-1>", lambda _event, value=name: self._select(value))
+        # Ri-mostra il badge se era stato nascosto dallo stato "nessuna materia".
+        self.subject_badge.pack(side="left", padx=(10, 0))
 
     # ------------------------------------------------------------------ detail
     def _render_detail(self) -> None:
@@ -344,7 +379,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(26, "bold"),
             text_color=COLORS.text,
             anchor="w",
-            wraplength=440,
+            wraplength=680,
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(2, 6))
         ctk.CTkLabel(
@@ -357,7 +392,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(11),
             text_color=COLORS.text_muted,
             anchor="w",
-            wraplength=440,
+            wraplength=680,
             justify="left",
         ).grid(row=2, column=0, sticky="w")
 
@@ -383,7 +418,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(10),
             text_color=COLORS.text_faint,
             anchor="w",
-            wraplength=420,
+            wraplength=660,
             justify="left",
         ).pack(anchor="w", padx=20, pady=14)
 
@@ -408,7 +443,7 @@ class SubjectsView(ctk.CTkFrame):
             text_color=COLORS.text_muted,
             anchor="w",
             justify="left",
-            wraplength=420,
+            wraplength=660,
         ).pack(anchor="w", padx=26, pady=(0, 16))
         ctk.CTkButton(
             card,
@@ -440,7 +475,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(26, "bold"),
             text_color=COLORS.text,
             anchor="w",
-            wraplength=440,
+            wraplength=680,
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(2, 6))
 
@@ -504,7 +539,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(24, "bold"),
             text_color=color,
             anchor="w",
-            wraplength=400,
+            wraplength=640,
             justify="left",
         )
         self._countdown_label.grid(row=1, column=0, sticky="w", padx=20, pady=(2, 0))
@@ -520,7 +555,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(10),
             text_color=COLORS.text_muted,
             anchor="w",
-            wraplength=400,
+            wraplength=640,
             justify="left",
         ).grid(row=2, column=0, sticky="w", padx=20, pady=(2, 4))
         if not countdown["defined"]:
@@ -668,7 +703,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(11),
             text_color=COLORS.text_muted if summary else COLORS.text_faint,
             anchor="w",
-            wraplength=410,
+            wraplength=660,
             justify="left",
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 6))
         ctk.CTkLabel(
@@ -677,7 +712,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(9),
             text_color=COLORS.text_faint,
             anchor="w",
-            wraplength=410,
+            wraplength=660,
             justify="left",
         ).grid(row=2, column=0, sticky="w", padx=20, pady=(0, 14))
 
@@ -701,7 +736,7 @@ class SubjectsView(ctk.CTkFrame):
             font=font(11),
             text_color=COLORS.text_muted,
             anchor="w",
-            wraplength=410,
+            wraplength=660,
             justify="left",
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 14))
 
@@ -1097,6 +1132,7 @@ class SubjectDialog(ctk.CTkToplevel):
             messagebox.showerror("Salvataggio non riuscito", str(exc), parent=self)
             return
         self.view._selected = str(saved.get("name") or name)
+        self.view._remember_selection(self.view._selected)
         self._close()
         self.view.refresh()
         self.app.toast("Materia salvata.")
